@@ -70,6 +70,7 @@
 #include "utils/resowner.h"
 #include "utils/timestamp.h"
 #include "utils/wait_event.h"
+#include "access/lsn_indexer.h"
 
 
 /* Note: these two macros only work on shared buffers, not local ones! */
@@ -1363,6 +1364,25 @@ ReadBuffer_common(Relation rel, SMgrRelation smgr, char smgr_persistence,
 						blockNum,
 						readflags))
 		WaitReadBuffers(&operation);
+
+	/*
+	 * On-demand WAL replay for fast recovery: after the page is loaded from
+	 * disk (BM_VALID set), check if this page has pending WAL records and
+	 * replay them.  We acquire an exclusive content lock to prevent other
+	 * backends from reading stale data while replay is in progress.
+	 *
+	 * Skip if we're already inside a replay (prevents recursion when redo
+	 * functions read buffers).
+	 */
+	if (enable_fast_recovery && !inReplayPageWals && LSNIndexIsActive())
+	{
+		BufferDesc *buf_hdr = GetBufferDescriptor(buffer - 1);
+		BufferTag	buf_tag = buf_hdr->tag;
+
+		LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
+		LSNIndexReplayPage(&buf_tag);
+		LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
+	}
 
 	return buffer;
 }

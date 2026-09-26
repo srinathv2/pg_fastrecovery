@@ -107,6 +107,7 @@
 #include "storage/smgr.h"
 #include "utils/inval.h"
 #include "utils/rel.h"
+#include "access/lsn_indexer.h"
 
 
 /*#define TRACE_VISIBILITYMAP */
@@ -209,7 +210,8 @@ void
 visibilitymap_pin(Relation rel, BlockNumber heapBlk, Buffer *vmbuf)
 {
 	BlockNumber mapBlock = HEAPBLK_TO_MAPBLOCK(heapBlk);
-
+	BufferTag	tag;
+	RelFileLocator rlocator = rel->rd_locator;
 	/* Reuse the old pinned buffer if possible */
 	if (BufferIsValid(*vmbuf))
 	{
@@ -218,7 +220,17 @@ visibilitymap_pin(Relation rel, BlockNumber heapBlk, Buffer *vmbuf)
 
 		ReleaseBuffer(*vmbuf);
 	}
-	*vmbuf = vm_readbuf(rel, mapBlock, true);
+	InitBufferTag(&tag, &rlocator, VISIBILITYMAP_FORKNUM, mapBlock);
+	if (inReplayPageWals && !BufferTagsEqual(&targetTag, &tag))
+	{
+		bool foundPtr;
+		SMgrRelation smgr = smgropen(rlocator,INVALID_PROC_NUMBER);
+		*vmbuf = BufferDescriptorGetBuffer(LocalBufferAlloc(smgr,VISIBILITYMAP_FORKNUM,mapBlock,&foundPtr));			
+	}
+	else
+	{
+		*vmbuf = vm_readbuf(rel, mapBlock, true);
+	}
 }
 
 /*

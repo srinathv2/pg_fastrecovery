@@ -109,6 +109,7 @@
 #include "utils/timestamp.h"
 #include "utils/varlena.h"
 #include "utils/wait_event.h"
+#include "access/lsn_indexer.h"
 
 #ifdef WAL_DEBUG
 #include "utils/memutils.h"
@@ -6062,6 +6063,12 @@ CheckRequiredParameterValues(void)
 	}
 }
 
+int
+get_control_state(void)
+{
+	return ControlFile->state;
+}
+
 /*
  * This must be called ONCE during postmaster or standalone-backend startup
  */
@@ -6542,7 +6549,8 @@ StartupXLOG(void)
 		 * We're all set for replaying the WAL now. Do it.
 		 */
 		PerformWalRecovery();
-		performedWalRecovery = true;
+		if(!enable_fast_recovery)
+			performedWalRecovery = true;
 	}
 	else
 		performedWalRecovery = false;
@@ -9270,7 +9278,6 @@ xlog_redo(XLogReaderState *record)
 {
 	uint8		info = XLogRecGetInfo(record) & ~XLR_INFO_MASK;
 	XLogRecPtr	lsn = record->EndRecPtr;
-
 	/*
 	 * In XLOG rmgr, backup blocks are only used by XLOG_FPI and
 	 * XLOG_FPI_FOR_HINT records.

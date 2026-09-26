@@ -123,6 +123,7 @@
 #include "utils/pidfile.h"
 #include "utils/timestamp.h"
 #include "utils/varlena.h"
+#include "access/lsn_indexer.h"
 
 #ifdef EXEC_BACKEND
 #include "common/file_utils.h"
@@ -268,6 +269,9 @@ static PMChild *StartupPMChild = NULL,
 		   *PgArchPMChild = NULL,
 		   *SysLoggerPMChild = NULL,
 		   *SlotSyncWorkerPMChild = NULL;
+
+PMChild *FastRecoveryWorkerPMChild = NULL;
+
 
 /* Startup process's status */
 typedef enum
@@ -1396,7 +1400,7 @@ PostmasterMain(int argc, char *argv[])
 	maybe_start_io_workers();
 
 	/* Start bgwriter and checkpointer so they can help with recovery */
-	if (CheckpointerPMChild == NULL)
+	if (CheckpointerPMChild == NULL && !enable_fast_recovery)
 		CheckpointerPMChild = StartChildProcess(B_CHECKPOINTER);
 	if (BgWriterPMChild == NULL)
 		BgWriterPMChild = StartChildProcess(B_BG_WRITER);
@@ -2362,7 +2366,8 @@ process_pm_child_exit(void)
 			AbortStartTime = 0;
 			UpdatePMState(PM_RUN);
 			connsAllowed = true;
-
+			if (enable_fast_recovery && LSNIndexIsActive())
+				FastRecoveryWorkerPMChild = StartChildProcess(B_FAST_RECOVERY_WORKER);
 			/*
 			 * At the next iteration of the postmaster's main loop, we will
 			 * crank up the background tasks like the autovacuum launcher and
@@ -2383,6 +2388,16 @@ process_pm_child_exit(void)
 			continue;
 		}
 
+		if (FastRecoveryWorkerPMChild && pid == FastRecoveryWorkerPMChild->pid)
+		{
+			ReleasePostmasterChildSlot(FastRecoveryWorkerPMChild);
+			FastRecoveryWorkerPMChild = NULL;
+			if (!EXIT_STATUS_0(exitstatus))
+				HandleChildCrash(pid, exitstatus,
+								 _("Fast Recovery Worker process"));
+			continue;
+		}
+		
 		/*
 		 * Was it the bgwriter?  Normal exit can be ignored; we'll start a new
 		 * one at the next iteration of the postmaster's main loop, if
@@ -2976,6 +2991,10 @@ PostmasterStateMachine(void)
 								B_STARTUP,
 								B_WAL_RECEIVER);
 
+		targetMask = btmask_add(targetMask,
+								B_FAST_RECOVERY_WORKER);
+
+
 		/*
 		 * If we are doing crash recovery or an immediate shutdown then we
 		 * expect archiver, checkpointer, io workers and walsender to exit as
@@ -3373,7 +3392,7 @@ LaunchMissingBackgroundProcesses(void)
 	if (pmState == PM_RUN || pmState == PM_RECOVERY ||
 		pmState == PM_HOT_STANDBY || pmState == PM_STARTUP)
 	{
-		if (CheckpointerPMChild == NULL)
+		if (CheckpointerPMChild == NULL && !(enable_fast_recovery && LSNIndexIsActive()))
 			CheckpointerPMChild = StartChildProcess(B_CHECKPOINTER);
 		if (BgWriterPMChild == NULL)
 			BgWriterPMChild = StartChildProcess(B_BG_WRITER);

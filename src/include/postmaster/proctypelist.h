@@ -51,3 +51,4 @@ PG_PROCTYPE(B_WAL_RECEIVER, "walreceiver", gettext_noop("walreceiver"), WalRecei
 PG_PROCTYPE(B_WAL_SENDER, "walsender", gettext_noop("walsender"), NULL, true)
 PG_PROCTYPE(B_WAL_SUMMARIZER, "walsummarizer", gettext_noop("walsummarizer"), WalSummarizerMain, true)
 PG_PROCTYPE(B_WAL_WRITER, "walwriter", gettext_noop("walwriter"), WalWriterMain, true)
+PG_PROCTYPE(B_FAST_RECOVERY_WORKER, "fast_recovery_worker", FastRecoveryWorkerMain, true)

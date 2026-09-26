@@ -68,6 +68,7 @@
 #include "utils/ps_status.h"
 #include "utils/pg_rusage.h"
 #include "utils/wait_event.h"
+#include "access/lsn_indexer.h"
 
 /* Unsupported old recovery command file names (relative to $PGDATA) */
 #define RECOVERY_COMMAND_FILE	"recovery.conf"
@@ -876,9 +877,15 @@ InitWalRecovery(ControlFileData *ControlFile, bool *wasShutdown_ptr,
 			ereport(PANIC,
 					(errmsg("invalid redo record in shutdown checkpoint")));
 		InRecovery = true;
+		if (enable_fast_recovery)
+			LSNIndexInit();
 	}
 	else if (ControlFile->state != DB_SHUTDOWNED)
+	{
 		InRecovery = true;
+		if (enable_fast_recovery)
+			LSNIndexInit();
+	}
 	else if (ArchiveRecoveryRequested)
 	{
 		/* force recovery due to presence of recovery signal file */
@@ -1969,15 +1976,24 @@ ApplyWalRecord(XLogReaderState *xlogreader, XLogRecord *record, TimeLineID *repl
 		TransactionIdIsValid(record->xl_xid))
 		RecordKnownAssignedTransactionIds(record->xl_xid);
 
-	/*
-	 * Some XLOG record types that are related to recovery are processed
-	 * directly here, rather than in xlog_redo()
-	 */
-	if (record->xl_rmid == RM_XLOG_ID)
-		xlogrecovery_redo(xlogreader, *replayTLI);
+	if (enable_fast_recovery)
+	{
+		if (record->xl_rmid == RM_XACT_ID)
+			GetRmgr(record->xl_rmid).rm_redo(xlogreader);
+		LSNIndexAddEntry(xlogreader);
+	}
+	else
+	{
+		/*
+		* Some XLOG record types that are related to recovery are processed
+		* directly here, rather than in xlog_redo()
+		*/
+		if (record->xl_rmid == RM_XLOG_ID)
+			xlogrecovery_redo(xlogreader, *replayTLI);
 
-	/* Now apply the WAL record itself */
-	GetRmgr(record->xl_rmid).rm_redo(xlogreader);
+		/* Now apply the WAL record itself */
+		GetRmgr(record->xl_rmid).rm_redo(xlogreader);	
+	}
 
 	/*
 	 * After redo, check whether the backup pages associated with the WAL

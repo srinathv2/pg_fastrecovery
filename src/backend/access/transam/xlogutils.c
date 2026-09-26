@@ -28,6 +28,7 @@
 #include "storage/smgr.h"
 #include "utils/hsearch.h"
 #include "utils/rel.h"
+#include "access/lsn_indexer.h"
 
 
 /* GUC variable */
@@ -381,6 +382,31 @@ XLogReadBufferForRedoExtended(XLogReaderState *record,
 			 block_id);
 	}
 
+	/* During on-demand replay, skip blocks that are not the target page */
+	if (inReplayPageWals)
+	{
+		BufferTag	recordTag;
+
+		InitBufferTag(&recordTag, &rlocator, forknum, blkno);
+
+		if (!BufferTagsEqual(&targetTag, &recordTag))
+		{
+			if (mode == RBM_ZERO_AND_LOCK || mode == RBM_ZERO_AND_CLEANUP_LOCK)
+			{
+				bool		foundPtr;
+				SMgrRelation smgr = smgropen(rlocator, INVALID_PROC_NUMBER);
+
+				*buf = BufferDescriptorGetBuffer(LocalBufferAlloc(smgr, forknum, blkno, &foundPtr));
+				return BLK_DONE;
+			}
+			else
+			{
+				*buf = InvalidBuffer;
+				return BLK_DONE;
+			}
+		}
+	}
+
 	/*
 	 * Make sure that if the block is marked with WILL_INIT, the caller is
 	 * going to initialize it. And vice versa.
@@ -544,7 +570,7 @@ XLogReadBufferExtended(RelFileLocator rlocator, ForkNumber forknum,
 	}
 
 recent_buffer_fast_path:
-	if (mode == RBM_NORMAL)
+	if (mode == RBM_NORMAL && !inReplayPageWals)
 	{
 		/* check that page has been initialized */
 		Page		page = BufferGetPage(buffer);
