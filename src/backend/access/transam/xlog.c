@@ -6551,6 +6551,8 @@ StartupXLOG(void)
 		PerformWalRecovery();
 		if(!enable_fast_recovery)
 			performedWalRecovery = true;
+		else
+			performedWalRecovery = false;
 	}
 	else
 		performedWalRecovery = false;

@@ -420,6 +420,8 @@ XactSLRU	"Waiting to access the transaction status SLRU cache."
 ParallelVacuumDSA	"Waiting for parallel vacuum dynamic shared memory allocation."
 AioUringCompletion	"Waiting for another process to complete IO via io_uring."
 ShmemIndex	"Waiting to find or allocate space in shared memory."
+LSNIndexDSA	"Waiting for fast recovery LSN index dynamic shared memory allocation."
+LSNIndexHash	"Waiting to access the fast recovery LSN index hash table."
 
 # No "ABI_compatibility" region here as WaitEventLWLock has its own C code.
 

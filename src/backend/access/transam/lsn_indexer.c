@@ -57,9 +57,11 @@ static const dshash_parameters lsn_dsh_params = {
 	LWTRANCHE_LSN_INDEX_HASH			/* tranche_id */
 };
 
+static void LSNIndexShmemRequest(void *arg);
+
 const ShmemCallbacks LsnIndexerShmemCallbacks = {
 	.request_fn = LSNIndexShmemRequest,
-	.init_fn = LSNIndexInit,
+	.init_fn = LSNIndexShmemInit,
 };
 
 /* ----------------------------------------------------------------
@@ -80,7 +82,7 @@ const ShmemCallbacks LsnIndexerShmemCallbacks = {
 // 	return MAXALIGN(sizeof(LSNIndexControl));
 // }
 
-void
+static void
 LSNIndexShmemRequest(void *arg)
 {
 	Size size;
@@ -110,21 +112,16 @@ LSNIndexShmemRequest(void *arg)
  * Called from CreateOrAttachShmemStructs.
  */
 void
-LSNIndexShmemInit(void)
+LSNIndexShmemInit(void *arg)
 {
 	bool	found;
 
 	if(!enable_fast_recovery)
 		return;
-	LSNIndexCtl = (LSNIndexControl *)
-		ShmemInitStruct("LSN Index Control", sizeof(LSNIndexControl), &found);
 
-	if (!found)
-	{
-		LSNIndexCtl->dsa_handle = DSA_HANDLE_INVALID;
-		LSNIndexCtl->hash_handle = DSHASH_HANDLE_INVALID;
-		LSNIndexCtl->is_active = false;
-	}
+	LSNIndexCtl->dsa_handle = DSA_HANDLE_INVALID;
+	LSNIndexCtl->hash_handle = DSHASH_HANDLE_INVALID;
+	LSNIndexCtl->is_active = false;
 }
 
 /* ----------------------------------------------------------------

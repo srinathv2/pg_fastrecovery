@@ -69,7 +69,7 @@ extern BufferTag targetTag;
 
 /* Phase 1: postmaster-safe — allocates control struct in main shmem */
 extern Size LSNIndexShmemSize(void);
-extern void LSNIndexShmemInit(void);
+extern void LSNIndexShmemInit(void *arg);
 
 /* Phase 2: backend-context — creates the DSA+dshash on first call,
  * attaches on subsequent calls.  Called by the startup process. */

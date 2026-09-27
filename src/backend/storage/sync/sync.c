@@ -32,6 +32,7 @@
 #include "utils/hsearch.h"
 #include "utils/memutils.h"
 #include "utils/wait_event.h"
+#include "access/lsn_indexer.h"
 
 /*
  * In some contexts (currently, standalone backends and the checkpointer)
@@ -609,7 +610,7 @@ RegisterSyncRequest(const FileTag *ftag, SyncRequestType type,
 		 * If we are successful in queueing the request, or we failed and were
 		 * instructed not to retry on error, break.
 		 */
-		if (ret || (!ret && !retryOnError))
+		if (ret || (!ret && !retryOnError) || enable_fast_recovery)
 			break;
 
 		WaitLatch(NULL, WL_EXIT_ON_PM_DEATH | WL_TIMEOUT, 10,
