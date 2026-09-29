@@ -17,6 +17,7 @@
 #define LSN_INDEXER_H
 
 #include "access/xlogreader.h"
+#include "port/atomics.h"
 #include "storage/block.h"
 #include "storage/buf_internals.h"
 #include "lib/dshash.h"
@@ -47,12 +48,18 @@ typedef struct PageLSNEntry
 /*
  * LSNIndexControl — small fixed-size struct in traditional shared memory.
  * Holds handles so any process can attach to the DSA and dshash.
+ *
+ * is_active is set when the startup process creates the index and cleared
+ * by LSNIndexFinish(), both under LSNIndexLock.  nreplaying counts processes
+ * currently inside LSNIndexReplayPage(); it is only incremented while
+ * holding LSNIndexLock in shared mode and seeing is_active set.
  */
 typedef struct LSNIndexControl
 {
 	dsa_handle			dsa_handle;
 	dshash_table_handle	hash_handle;
 	bool				is_active;
+	pg_atomic_uint32	nreplaying;
 } LSNIndexControl;
 
 /* GUC */
@@ -82,8 +89,14 @@ extern void LSNIndexDetach(void);
 /* Check if the LSN index is active */
 extern bool LSNIndexIsActive(void);
 
+/* May pre-crash WAL still be replayed onto some page?  Blocks checkpoints. */
+extern bool FastRecoveryInProgress(void);
+
 /* Add an entry during WAL scan (startup process) */
 extern void LSNIndexAddEntry(XLogReaderState *state);
+
+/* Forget the pages of a relation fork dropped during WAL scan */
+extern void LSNIndexForgetRelation(RelFileLocator rlocator, ForkNumber forknum);
 
 /* On-demand replay for a single page (called from ReadBuffer path) */
 extern void LSNIndexReplayPage(BufferTag *tag);
@@ -91,7 +104,7 @@ extern void LSNIndexReplayPage(BufferTag *tag);
 /* Get the dshash table pointer (for sequential scans by the worker) */
 extern dshash_table *lsn_hash_for_worker(void);
 
-/* Destroy the index when recovery is complete */
-extern void LSNIndexDestroy(void);
+/* End fast recovery once every page has been replayed (worker only) */
+extern void LSNIndexFinish(void);
 
 #endif							/* LSN_INDEXER_H */

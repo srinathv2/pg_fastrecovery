@@ -7714,6 +7714,20 @@ CreateCheckPoint(int flags)
 		elog(ERROR, "can't create a checkpoint during recovery");
 
 	/*
+	 * A completed checkpoint promises that everything before its redo point
+	 * is on disk.  While fast crash recovery may still replay pre-crash WAL
+	 * onto some page, that promise would be false; see
+	 * FastRecoveryInProgress().  Erroring out here also fails any backend
+	 * waiting for this checkpoint, via the checkpointer's error handling.
+	 */
+	if (FastRecoveryInProgress())
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("cannot create a checkpoint while fast crash recovery is in progress"),
+				 errdetail("Some pages have not been recovered from WAL yet."),
+				 errhint("Retry after the fast recovery worker has finished.")));
+
+	/*
 	 * Prepare to accumulate statistics.
 	 *
 	 * Note: because it is possible for log_checkpoints to change while a
@@ -8499,6 +8513,15 @@ CreateRestartPoint(int flags)
 
 	/* Concurrent checkpoint/restartpoint cannot happen */
 	Assert(!IsUnderPostmaster || MyBackendType == B_CHECKPOINTER);
+
+	/*
+	 * A restartpoint moves the redo point in pg_control just like a
+	 * checkpoint, so it must not happen while fast crash recovery has pages
+	 * left to replay either.  Report it as not performed; the checkpointer
+	 * then retries later.
+	 */
+	if (FastRecoveryInProgress())
+		return false;
 
 	/* Get a local copy of the last safe checkpoint record. */
 	SpinLockAcquire(&XLogCtl->info_lck);

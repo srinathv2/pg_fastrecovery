@@ -674,12 +674,14 @@ FreeFakeRelcacheEntry(Relation fakerel)
  * Drop a relation during XLOG replay
  *
  * This is called when the relation is about to be deleted; we need to remove
- * any open "invalid-page" records for the relation.
+ * any open "invalid-page" records for the relation, and during fast crash
+ * recovery its pending records in the LSN index.
  */
 void
 XLogDropRelation(RelFileLocator rlocator, ForkNumber forknum)
 {
 	forget_invalid_pages(rlocator, forknum, 0);
+	LSNIndexForgetRelation(rlocator, forknum);
 }
 
 /*

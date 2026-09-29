@@ -19,13 +19,16 @@
 #include "access/xlogutils.h"
 #include "access/lsn_indexer.h"
 #include "lib/dshash.h"
+#include "miscadmin.h"
 #include "storage/buf_internals.h"
 #include "storage/bufmgr.h"
+#include "storage/latch.h"
 #include "storage/lwlock.h"
 #include "storage/shmem.h"
 #include "utils/dsa.h"
 #include "utils/hsearch.h"
 #include "utils/memutils.h"
+#include "utils/wait_event.h"
 #include "common/hashfn.h"
 
 /* GUC variable */
@@ -114,14 +117,13 @@ LSNIndexShmemRequest(void *arg)
 void
 LSNIndexShmemInit(void *arg)
 {
-	bool	found;
-
-	if(!enable_fast_recovery)
+	if (!enable_fast_recovery)
 		return;
 
 	LSNIndexCtl->dsa_handle = DSA_HANDLE_INVALID;
 	LSNIndexCtl->hash_handle = DSHASH_HANDLE_INVALID;
 	LSNIndexCtl->is_active = false;
+	pg_atomic_init_u32(&LSNIndexCtl->nreplaying, 0);
 }
 
 /* ----------------------------------------------------------------
@@ -300,37 +302,81 @@ LSNIndexAddEntry(XLogReaderState *state)
 	}
 }
 
+/*
+ * LSNIndexForgetRelation - forget the pages of a relation fork that WAL
+ * replay is dropping.
+ *
+ * Called from XLogDropRelation(), next to forgetting the fork's invalid
+ * pages, when replay of a commit or abort record is about to unlink the
+ * files of a dropped relation.  Their pending records must never be
+ * replayed: the pages are dead, and reading them later would fail because
+ * the files are gone.
+ *
+ * Only entries indexed so far are removed.  WAL is scanned in LSN order, so
+ * these are exactly the records written before the drop; should the
+ * relfilenumber be reused later in the WAL, the new relation's entries are
+ * added after this and kept.
+ *
+ * This scans the whole index, which is fine for a handful of drops.  A
+ * workload dropping many relations would want a per-relation list of the
+ * blocks in the index.
+ */
+void
+LSNIndexForgetRelation(RelFileLocator rlocator, ForkNumber forknum)
+{
+	dshash_seq_status seq;
+	PageLSNEntry *entry;
+	int			nforgotten = 0;
+
+	/* Only the startup process, while it builds the index. */
+	if (lsn_hash == NULL || !AmStartupProcess())
+		return;
+
+	dshash_seq_init(&seq, lsn_hash, true);
+	while ((entry = (PageLSNEntry *) dshash_seq_next(&seq)) != NULL)
+	{
+		RelFileLocator entry_rlocator = BufTagGetRelFileLocator(&entry->tag);
+		dsa_pointer node_dp;
+
+		if (!RelFileLocatorEquals(entry_rlocator, rlocator) ||
+			BufTagGetForkNum(&entry->tag) != forknum)
+			continue;
+
+		/* free the page's list of LSNs, then the entry itself */
+		node_dp = entry->lsn_head;
+		while (DsaPointerIsValid(node_dp))
+		{
+			dsa_pointer next_dp;
+
+			next_dp = ((LSNNode *) dsa_get_address(lsn_dsa, node_dp))->next;
+			dsa_free(lsn_dsa, node_dp);
+			node_dp = next_dp;
+		}
+		dshash_delete_current(&seq);
+		nforgotten++;
+	}
+	dshash_seq_term(&seq);
+
+	if (nforgotten > 0)
+		elog(DEBUG1, "fast recovery: forgot %d pages of dropped relation %u/%u/%u fork %d",
+			 nforgotten, rlocator.spcOid, rlocator.dbOid, rlocator.relNumber,
+			 forknum);
+}
+
 /* ----------------------------------------------------------------
  *  On-demand WAL replay for a single page
  * ----------------------------------------------------------------
  */
 
-void
-LSNIndexReplayPage(BufferTag *tag)
+/*
+ * Replay, in LSN order, the indexed records that touch the page 'tag'.
+ */
+static void
+ReplayPageRecords(BufferTag *tag, dsa_pointer head_dp)
 {
-	PageLSNEntry   *entry;
 	dsa_pointer		node_dp;
-	dsa_pointer		head_dp;
 	XLogReaderState *xlogreader;
 	char		   *errormsg = NULL;
-
-	if (!enable_fast_recovery || !LSNIndexIsActive())
-		return;
-
-	/* Attach lazily if not yet done */
-	if (lsn_hash == NULL)
-		LSNIndexAttach();
-	if (lsn_hash == NULL)
-		return;
-
-	/* Look up this page in the hash table (shared lock) */
-	entry = (PageLSNEntry *) dshash_find(lsn_hash, tag, false);
-	if (entry == NULL)
-		return;					/* no pending WALs for this page */
-
-	/* Copy what we need and release the dshash lock */
-	head_dp = entry->lsn_head;
-	dshash_release_lock(lsn_hash, entry);
 
 	RmgrStartup();
 
@@ -398,8 +444,82 @@ LSNIndexReplayPage(BufferTag *tag)
 
 	XLogReaderFree(xlogreader);
 	RmgrCleanup();
+}
 
+/*
+ * Register this process as replaying a page, unless fast recovery is over.
+ *
+ * From here until LSNIndexEndReplay(), FastRecoveryInProgress() counts us,
+ * which keeps a checkpoint from starting while the page we are replaying has
+ * not been dirtied yet.  We check is_active and increment the counter under
+ * LSNIndexLock, so LSNIndexFinish(), which clears is_active under the same
+ * lock in exclusive mode, sees every replay that got in.
+ */
+static bool
+LSNIndexBeginReplay(void)
+{
+	bool		active;
+
+	if (LSNIndexCtl == NULL)
+		return false;
+
+	LWLockAcquire(LSNIndexLock, LW_SHARED);
+	active = LSNIndexCtl->is_active;
+	if (active)
+		pg_atomic_fetch_add_u32(&LSNIndexCtl->nreplaying, 1);
+	LWLockRelease(LSNIndexLock);
+
+	return active;
+}
+
+static void
+LSNIndexEndReplay(void)
+{
 	inReplayPageWals = false;
+	pg_atomic_fetch_sub_u32(&LSNIndexCtl->nreplaying, 1);
+}
+
+/*
+ * LSNIndexReplayPage - replay the pending WAL records of one page.
+ *
+ * Called from the buffer read path.  If redo fails, the PG_FINALLY block
+ * still unregisters us; a leaked count would block checkpoints until the
+ * next restart.
+ */
+void
+LSNIndexReplayPage(BufferTag *tag)
+{
+	if (!enable_fast_recovery || !LSNIndexBeginReplay())
+		return;
+
+	PG_TRY();
+	{
+		PageLSNEntry *entry = NULL;
+
+		/*
+		 * Attach lazily.  Our registration keeps the index from being freed
+		 * under us.  If LSNIndexFinish() cleared is_active after we
+		 * registered, LSNIndexAttach() does nothing and we skip the page:
+		 * the worker has already replayed every page in the index.
+		 */
+		if (lsn_hash == NULL)
+			LSNIndexAttach();
+		if (lsn_hash != NULL)
+			entry = (PageLSNEntry *) dshash_find(lsn_hash, tag, false);
+
+		if (entry != NULL)
+		{
+			dsa_pointer head_dp = entry->lsn_head;
+
+			dshash_release_lock(lsn_hash, entry);
+			ReplayPageRecords(tag, head_dp);
+		}
+	}
+	PG_FINALLY();
+	{
+		LSNIndexEndReplay();
+	}
+	PG_END_TRY();
 }
 
 /* ----------------------------------------------------------------
@@ -415,13 +535,46 @@ lsn_hash_for_worker(void)
 }
 
 /* ----------------------------------------------------------------
- *  Destroy (called by fast-recovery worker on completion)
+ *  End of fast recovery
  * ----------------------------------------------------------------
  */
 
-void
+/*
+ * FastRecoveryInProgress - may pre-crash WAL still be replayed onto a page?
+ *
+ * True while the index is active, and afterwards until the last replay that
+ * was already running has finished.  No checkpoint may start while this is
+ * true.  A completed checkpoint promises that everything before its redo
+ * point is on disk, and a crash after it starts recovery at that redo point.
+ * A page that has not been replayed yet, or that a running replay dirties
+ * after the checkpoint has collected its dirty buffers, would then never get
+ * its pre-crash WAL replayed.
+ */
+bool
+FastRecoveryInProgress(void)
+{
+	bool		result;
+
+	if (LSNIndexCtl == NULL)
+		return false;
+
+	LWLockAcquire(LSNIndexLock, LW_SHARED);
+	result = LSNIndexCtl->is_active ||
+		pg_atomic_read_u32(&LSNIndexCtl->nreplaying) > 0;
+	LWLockRelease(LSNIndexLock);
+
+	return result;
+}
+
+/*
+ * Free the DSA and dshash.  Only safe once nobody can reach them anymore.
+ */
+static void
 LSNIndexDestroy(void)
 {
+	Assert(!LSNIndexCtl->is_active);
+	Assert(pg_atomic_read_u32(&LSNIndexCtl->nreplaying) == 0);
+
 	if (lsn_hash != NULL)
 	{
 		dshash_destroy(lsn_hash);
@@ -433,6 +586,35 @@ LSNIndexDestroy(void)
 		dsa_detach(lsn_dsa);
 		lsn_dsa = NULL;
 	}
-	if (LSNIndexCtl != NULL)
-		LSNIndexCtl->is_active = false;
+
+	LWLockAcquire(LSNIndexLock, LW_EXCLUSIVE);
+	LSNIndexCtl->dsa_handle = DSA_HANDLE_INVALID;
+	LSNIndexCtl->hash_handle = DSHASH_HANDLE_INVALID;
+	LWLockRelease(LSNIndexLock);
+}
+
+/*
+ * LSNIndexFinish - end fast recovery.
+ *
+ * Called by the fast recovery worker once it has read every page in the
+ * index.  Stops new on-demand replays, waits for the ones already running,
+ * and only then frees the index.  FastRecoveryInProgress() turns false when
+ * the wait is over, not before.
+ */
+void
+LSNIndexFinish(void)
+{
+	LWLockAcquire(LSNIndexLock, LW_EXCLUSIVE);
+	LSNIndexCtl->is_active = false;
+	LWLockRelease(LSNIndexLock);
+
+	while (pg_atomic_read_u32(&LSNIndexCtl->nreplaying) > 0)
+	{
+		(void) WaitLatch(MyLatch,
+						 WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
+						 10L, WAIT_EVENT_FAST_RECOVERY_DRAIN);
+		ResetLatch(MyLatch);
+	}
+
+	LSNIndexDestroy();
 }

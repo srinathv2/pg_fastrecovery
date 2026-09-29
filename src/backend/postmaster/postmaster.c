@@ -1400,7 +1400,7 @@ PostmasterMain(int argc, char *argv[])
 	maybe_start_io_workers();
 
 	/* Start bgwriter and checkpointer so they can help with recovery */
-	if (CheckpointerPMChild == NULL && !enable_fast_recovery)
+	if (CheckpointerPMChild == NULL)
 		CheckpointerPMChild = StartChildProcess(B_CHECKPOINTER);
 	if (BgWriterPMChild == NULL)
 		BgWriterPMChild = StartChildProcess(B_BG_WRITER);
@@ -2991,9 +2991,13 @@ PostmasterStateMachine(void)
 								B_STARTUP,
 								B_WAL_RECEIVER);
 
+		/*
+		 * Also wait for the fast recovery worker.  It ignores SIGTERM: the
+		 * shutdown checkpoint must not be written while pages are still
+		 * unrecovered, so a smart or fast shutdown lets it finish first.
+		 */
 		targetMask = btmask_add(targetMask,
 								B_FAST_RECOVERY_WORKER);
-
 
 		/*
 		 * If we are doing crash recovery or an immediate shutdown then we
@@ -3070,6 +3074,16 @@ PostmasterStateMachine(void)
 			else
 			{
 				SignalChildren(SIGTERM, targetMask);
+
+				/*
+				 * The fast recovery worker ignores SIGTERM too, on purpose: a
+				 * shutdown checkpoint must not be written while pages are
+				 * still unrecovered, so we wait for it like a backend.
+				 */
+				if (FastRecoveryWorkerPMChild != NULL &&
+					Shutdown < ImmediateShutdown)
+					ereport(LOG,
+							(errmsg("waiting for fast crash recovery to finish before shutting down")));
 
 				UpdatePMState(PM_WAIT_BACKENDS);
 			}
@@ -3392,7 +3406,7 @@ LaunchMissingBackgroundProcesses(void)
 	if (pmState == PM_RUN || pmState == PM_RECOVERY ||
 		pmState == PM_HOT_STANDBY || pmState == PM_STARTUP)
 	{
-		if (CheckpointerPMChild == NULL && !(enable_fast_recovery && LSNIndexIsActive()))
+		if (CheckpointerPMChild == NULL)
 			CheckpointerPMChild = StartChildProcess(B_CHECKPOINTER);
 		if (BgWriterPMChild == NULL)
 			BgWriterPMChild = StartChildProcess(B_BG_WRITER);

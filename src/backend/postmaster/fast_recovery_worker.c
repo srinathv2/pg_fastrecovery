@@ -15,11 +15,15 @@
 #include "access/xlog_internal.h"
 #include "access/rmgr.h"
 #include "lib/dshash.h"
+#include "libpq/pqsignal.h"
 #include "storage/bufmgr.h"
 #include "access/lsn_indexer.h"
 #include "miscadmin.h"
 #include "postmaster/auxprocess.h"
+#include "postmaster/bgwriter.h"
+#include "postmaster/interrupt.h"
 #include "storage/ipc.h"
+#include "storage/procsignal.h"
 #include "postmaster/fast_recovery_worker.h"
 
 /*
@@ -75,6 +79,9 @@ FastRecoveryMain(void)
 	{
 		Buffer buffer;
 
+		/* keep up with ProcSignal barriers and config reloads */
+		ProcessMainLoopInterrupts();
+
 		buffer = ReadBufferWithoutRelcache(BufTagGetRelFileLocator(&tags[i]),
 										   tags[i].forkNum,
 										   tags[i].blockNum,
@@ -85,8 +92,20 @@ FastRecoveryMain(void)
 	if (tags)
 		pfree(tags);
 
-	/* All pages recovered — destroy the index */
-	LSNIndexDestroy();
+	/*
+	 * Every page has been replayed.  End fast recovery: stop new replays,
+	 * wait out the running ones, free the index.  Checkpoints are allowed
+	 * from then on.
+	 */
+	LSNIndexFinish();
+
+	/*
+	 * Checkpoints were refused until now, so the last one is still the one
+	 * from before the crash, and another crash would have to recover all of
+	 * that WAL again.  Ask for a new checkpoint, like the end-of-recovery
+	 * checkpoint normal crash recovery takes, but without waiting for it.
+	 */
+	RequestCheckpoint(CHECKPOINT_FORCE);
 
 	elog(LOG, "Fast recovery complete. Exiting.");
 }
@@ -98,11 +117,26 @@ FastRecoveryWorkerMain(const void *startup_data, size_t startup_data_len)
 	AuxiliaryProcessMainCommon();
 
 	/*
-	 * Properly accept or ignore signals the postmaster might send us.
+	 * Properly accept or ignore signals that might be sent to us.
+	 *
+	 * SIGTERM is ignored on purpose.  A smart or fast shutdown must not write
+	 * its shutdown checkpoint while pages are still unrecovered, so the
+	 * postmaster waits for us to finish instead of stopping us: we are in
+	 * the set of processes it waits for in PM_WAIT_BACKENDS.  An immediate
+	 * shutdown uses SIGQUIT, whose handler InitPostmasterChild already set
+	 * up; it writes no checkpoint, so the next startup recovers again.
 	 */
+	pqsignal(SIGHUP, SignalHandlerForConfigReload);
 	pqsignal(SIGINT, PG_SIG_IGN);
+	pqsignal(SIGTERM, PG_SIG_IGN);
+	pqsignal(SIGALRM, PG_SIG_IGN);
 	pqsignal(SIGPIPE, PG_SIG_IGN);
+	pqsignal(SIGUSR1, procsignal_sigusr1_handler);
+	pqsignal(SIGUSR2, PG_SIG_IGN);
 	pqsignal(SIGCHLD, PG_SIG_DFL);
+
+	/* Unblock signals (they were blocked when the postmaster forked us) */
+	sigprocmask(SIG_SETMASK, &UnBlockSig, NULL);
 
 	FastRecoveryMain();
 
