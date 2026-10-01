@@ -681,7 +681,7 @@ void
 XLogDropRelation(RelFileLocator rlocator, ForkNumber forknum)
 {
 	forget_invalid_pages(rlocator, forknum, 0);
-	LSNIndexForgetRelation(rlocator, forknum);
+	LSNIndexForgetRelation(rlocator, forknum, 0);
 }
 
 /*
@@ -701,6 +701,7 @@ XLogDropDatabase(Oid dbid)
 	smgrdestroyall();
 
 	forget_invalid_pages_db(dbid);
+	LSNIndexForgetDatabase(dbid);
 }
 
 /*
@@ -713,6 +714,7 @@ XLogTruncateRelation(RelFileLocator rlocator, ForkNumber forkNum,
 					 BlockNumber nblocks)
 {
 	forget_invalid_pages(rlocator, forkNum, nblocks);
+	LSNIndexForgetRelation(rlocator, forkNum, nblocks);
 }
 
 /*

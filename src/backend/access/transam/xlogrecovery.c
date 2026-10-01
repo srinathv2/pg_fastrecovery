@@ -1976,23 +1976,27 @@ ApplyWalRecord(XLogReaderState *xlogreader, XLogRecord *record, TimeLineID *repl
 		TransactionIdIsValid(record->xl_xid))
 		RecordKnownAssignedTransactionIds(record->xl_xid);
 
-	if (enable_fast_recovery)
-	{
-		if (record->xl_rmid == RM_XACT_ID)
-			GetRmgr(record->xl_rmid).rm_redo(xlogreader);
+	/*
+	 * Fast crash recovery defers only the redo of relation pages.  A record
+	 * that references blocks is indexed by page and replayed when the page
+	 * is first read.  Every other record is replayed now: it reads no
+	 * relation pages, so it is cheap, and its effect is global (transaction
+	 * status, SLRUs, which files exist, where the catalogs live), so no
+	 * later event could trigger its replay.
+	 */
+	if (LSNIndexIsActive() && XLogRecHasAnyBlockRefs(xlogreader))
 		LSNIndexAddEntry(xlogreader);
-	}
 	else
 	{
 		/*
-		* Some XLOG record types that are related to recovery are processed
-		* directly here, rather than in xlog_redo()
-		*/
+		 * Some XLOG record types that are related to recovery are processed
+		 * directly here, rather than in xlog_redo()
+		 */
 		if (record->xl_rmid == RM_XLOG_ID)
 			xlogrecovery_redo(xlogreader, *replayTLI);
 
 		/* Now apply the WAL record itself */
-		GetRmgr(record->xl_rmid).rm_redo(xlogreader);	
+		GetRmgr(record->xl_rmid).rm_redo(xlogreader);
 	}
 
 	/*

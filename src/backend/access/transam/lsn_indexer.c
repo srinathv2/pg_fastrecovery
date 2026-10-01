@@ -302,44 +302,47 @@ LSNIndexAddEntry(XLogReaderState *state)
 	}
 }
 
-/*
- * LSNIndexForgetRelation - forget the pages of a relation fork that WAL
- * replay is dropping.
+/* ----------------------------------------------------------------
+ *  Forgetting pages that WAL replay removes
+ * ----------------------------------------------------------------
  *
- * Called from XLogDropRelation(), next to forgetting the fork's invalid
- * pages, when replay of a commit or abort record is about to unlink the
- * files of a dropped relation.  Their pending records must never be
- * replayed: the pages are dead, and reading them later would fail because
- * the files are gone.
+ * While the startup process builds the index, replaying a record that drops
+ * a relation, truncates one, or drops a database removes pages whose pending
+ * records must never be replayed.  Reading a dropped relation's pages would
+ * fail, because its files are gone; a truncated page could be created again
+ * later, at LSN 0, and a stale pre-truncation record would then be applied
+ * to it.
  *
  * Only entries indexed so far are removed.  WAL is scanned in LSN order, so
- * these are exactly the records written before the drop; should the
- * relfilenumber be reused later in the WAL, the new relation's entries are
- * added after this and kept.
+ * these are exactly the records written before the drop or truncation;
+ * should the relfilenumber or the block be used again later in the WAL, the
+ * new entries are added after this and kept.
  *
- * This scans the whole index, which is fine for a handful of drops.  A
+ * Each call scans the whole index, which is fine for a handful of drops.  A
  * workload dropping many relations would want a per-relation list of the
  * blocks in the index.
+ *
+ * XXX A truncation also clears the tail of the last surviving FSM and VM
+ * page.  That page keeps its pending records, and replaying them later
+ * re-applies pre-truncation state to the cleared tail.  Closing this needs
+ * the page to be replayed up to the truncation before it is applied.
  */
-void
-LSNIndexForgetRelation(RelFileLocator rlocator, ForkNumber forknum)
+
+typedef bool (*ForgetMatchFn) (const BufferTag *tag, const void *arg);
+
+static int
+forget_matching_pages(ForgetMatchFn match, const void *arg)
 {
 	dshash_seq_status seq;
 	PageLSNEntry *entry;
 	int			nforgotten = 0;
 
-	/* Only the startup process, while it builds the index. */
-	if (lsn_hash == NULL || !AmStartupProcess())
-		return;
-
 	dshash_seq_init(&seq, lsn_hash, true);
 	while ((entry = (PageLSNEntry *) dshash_seq_next(&seq)) != NULL)
 	{
-		RelFileLocator entry_rlocator = BufTagGetRelFileLocator(&entry->tag);
 		dsa_pointer node_dp;
 
-		if (!RelFileLocatorEquals(entry_rlocator, rlocator) ||
-			BufTagGetForkNum(&entry->tag) != forknum)
+		if (!match(&entry->tag, arg))
 			continue;
 
 		/* free the page's list of LSNs, then the entry itself */
@@ -357,10 +360,80 @@ LSNIndexForgetRelation(RelFileLocator rlocator, ForkNumber forknum)
 	}
 	dshash_seq_term(&seq);
 
+	return nforgotten;
+}
+
+typedef struct ForgetForkArg
+{
+	RelFileLocator rlocator;
+	ForkNumber	forknum;
+	BlockNumber minblkno;
+} ForgetForkArg;
+
+static bool
+match_fork_from(const BufferTag *tag, const void *arg)
+{
+	const ForgetForkArg *f = (const ForgetForkArg *) arg;
+	RelFileLocator tag_rlocator = BufTagGetRelFileLocator(tag);
+
+	return RelFileLocatorEquals(tag_rlocator, f->rlocator) &&
+		BufTagGetForkNum(tag) == f->forknum &&
+		tag->blockNum >= f->minblkno;
+}
+
+static bool
+match_database(const BufferTag *tag, const void *arg)
+{
+	return tag->dbOid == *(const Oid *) arg;
+}
+
+/*
+ * LSNIndexForgetRelation - forget the pages of a relation fork from block
+ * 'minblkno' on.
+ *
+ * Called from XLogDropRelation() with 0 and from XLogTruncateRelation() with
+ * the new length, next to forgetting the fork's invalid pages.
+ */
+void
+LSNIndexForgetRelation(RelFileLocator rlocator, ForkNumber forknum,
+					   BlockNumber minblkno)
+{
+	ForgetForkArg arg;
+	int			nforgotten;
+
+	/* Only while the index is being built, by the process building it. */
+	if (lsn_hash == NULL || !InRecovery)
+		return;
+
+	arg.rlocator = rlocator;
+	arg.forknum = forknum;
+	arg.minblkno = minblkno;
+	nforgotten = forget_matching_pages(match_fork_from, &arg);
+
 	if (nforgotten > 0)
-		elog(DEBUG1, "fast recovery: forgot %d pages of dropped relation %u/%u/%u fork %d",
+		elog(DEBUG1, "fast recovery: forgot %d pages of relation %u/%u/%u fork %d from block %u",
 			 nforgotten, rlocator.spcOid, rlocator.dbOid, rlocator.relNumber,
-			 forknum);
+			 forknum, minblkno);
+}
+
+/*
+ * LSNIndexForgetDatabase - forget every page of a database.
+ *
+ * Called from XLogDropDatabase().
+ */
+void
+LSNIndexForgetDatabase(Oid dbid)
+{
+	int			nforgotten;
+
+	if (lsn_hash == NULL || !InRecovery)
+		return;
+
+	nforgotten = forget_matching_pages(match_database, &dbid);
+
+	if (nforgotten > 0)
+		elog(DEBUG1, "fast recovery: forgot %d pages of dropped database %u",
+			 nforgotten, dbid);
 }
 
 /* ----------------------------------------------------------------

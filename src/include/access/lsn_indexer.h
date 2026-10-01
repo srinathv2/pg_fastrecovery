@@ -95,8 +95,10 @@ extern bool FastRecoveryInProgress(void);
 /* Add an entry during WAL scan (startup process) */
 extern void LSNIndexAddEntry(XLogReaderState *state);
 
-/* Forget the pages of a relation fork dropped during WAL scan */
-extern void LSNIndexForgetRelation(RelFileLocator rlocator, ForkNumber forknum);
+/* Forget pages removed by a drop or truncation replayed during WAL scan */
+extern void LSNIndexForgetRelation(RelFileLocator rlocator, ForkNumber forknum,
+								   BlockNumber minblkno);
+extern void LSNIndexForgetDatabase(Oid dbid);
 
 /* On-demand replay for a single page (called from ReadBuffer path) */
 extern void LSNIndexReplayPage(BufferTag *tag);
