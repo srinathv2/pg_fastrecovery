@@ -489,6 +489,23 @@ pgstat_tracks_io_object(BackendType bktype, IOObject io_object,
 		return false;
 	}
 
+	/*
+	 * The fast recovery worker reads relation pages into shared buffers,
+	 * evicting dirty ones as needed, and reads WAL to replay them on demand.
+	 * Replaying a record can hand its other pages scratch local buffers.  It
+	 * never uses a buffer access strategy and never initializes WAL segments.
+	 */
+	if (bktype == B_FAST_RECOVERY_WORKER)
+	{
+		if (io_context == IOCONTEXT_NORMAL &&
+			(io_object == IOOBJECT_RELATION ||
+			 io_object == IOOBJECT_TEMP_RELATION ||
+			 io_object == IOOBJECT_WAL))
+			return true;
+
+		return false;
+	}
+
 	return true;
 }
 
