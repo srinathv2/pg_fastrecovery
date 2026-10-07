@@ -430,7 +430,7 @@ XLogRecoveryShmemInit(void *arg)
 static void
 MaybeStartFastRecovery(void)
 {
-	if (!enable_fast_recovery)
+	if (!fast_crash_recovery)
 		return;
 
 	if (ArchiveRecoveryRequested || !IsUnderPostmaster)

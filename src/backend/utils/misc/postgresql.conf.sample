@@ -287,6 +287,7 @@
 # - Prefetching during recovery -
 
 #recovery_prefetch = try        # prefetch pages referenced in the WAL?
+#fast_crash_recovery = off		# replay WAL on demand after a crash, not before
 #wal_decode_buffer_size = 512kB # lookahead window used for prefetching
                                 # (change requires restart)
 
@@ -345,7 +346,6 @@
 #wal_summary_keep_time = '10d'  # when to remove old summary files, 0 = never
 
 # - Fast Recovery -
-#enable_fast_recovery = off
 
 
 #------------------------------------------------------------------------------

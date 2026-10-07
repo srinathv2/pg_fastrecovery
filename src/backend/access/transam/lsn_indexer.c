@@ -36,7 +36,7 @@
 #include "common/hashfn.h"
 
 /* GUC variable */
-bool enable_fast_recovery = false;
+bool fast_crash_recovery = false;
 
 /* Control structure in traditional shared memory */
 LSNIndexControl *LSNIndexCtl = NULL;
@@ -104,7 +104,7 @@ LSNIndexShmemRequest(void *arg)
 
 	size = MAXALIGN(sizeof(LSNIndexControl));
 
-	if(!enable_fast_recovery)
+	if(!fast_crash_recovery)
 		return;
 	ShmemRequestStruct(.name = "LSNIndex Ctl",
 					.size = size,
@@ -129,7 +129,7 @@ LSNIndexShmemRequest(void *arg)
 void
 LSNIndexShmemInit(void *arg)
 {
-	if (!enable_fast_recovery)
+	if (!fast_crash_recovery)
 		return;
 
 	LSNIndexCtl->dsa_handle = DSA_HANDLE_INVALID;

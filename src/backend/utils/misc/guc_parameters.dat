@@ -883,12 +883,6 @@
   boot_val => 'true',
 },
 
-{ name => 'enable_fast_recovery', type => 'bool', context => 'PGC_POSTMASTER', group => 'WAL_SETTINGS',
-  short_desc => 'Enables on-demand fast crash recovery using buffered WAL replay.',
-  variable => 'enable_fast_recovery',
-  boot_val => 'false',
-},
-
 { name => 'enable_gathermerge', type => 'bool', context => 'PGC_USERSET', group => 'QUERY_TUNING_METHOD',
   short_desc => 'Enables the planner\'s use of gather merge plans.',
   flags => 'GUC_EXPLAIN',
@@ -1087,6 +1081,13 @@
   boot_val => '1',
   min => '-15',
   max => '3',
+},
+
+{ name => 'fast_crash_recovery', type => 'bool', context => 'PGC_POSTMASTER', group => 'WAL_RECOVERY',
+  short_desc => 'Defers WAL replay in crash recovery until pages are first read.',
+  long_desc => 'The server accepts connections once the WAL has been scanned; each page is recovered when it is first read, and a background worker recovers the rest.',
+  variable => 'fast_crash_recovery',
+  boot_val => 'false',
 },
 
 { name => 'file_copy_method', type => 'enum', context => 'PGC_USERSET', group => 'RESOURCES_DISK',

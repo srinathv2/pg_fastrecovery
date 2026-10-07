@@ -64,7 +64,7 @@ typedef struct LSNIndexControl
 } LSNIndexControl;
 
 /* GUC */
-extern bool enable_fast_recovery;
+extern bool fast_crash_recovery;
 
 /* Shared control structure (in traditional shmem) */
 extern LSNIndexControl *LSNIndexCtl;

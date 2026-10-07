@@ -2366,7 +2366,7 @@ process_pm_child_exit(void)
 			AbortStartTime = 0;
 			UpdatePMState(PM_RUN);
 			connsAllowed = true;
-			if (enable_fast_recovery && LSNIndexIsActive())
+			if (fast_crash_recovery && LSNIndexIsActive())
 				FastRecoveryWorkerPMChild = StartChildProcess(B_FAST_RECOVERY_WORKER);
 			/*
 			 * At the next iteration of the postmaster's main loop, we will

@@ -549,7 +549,7 @@ pgstat_tracks_io_op(BackendType bktype, IOObject io_object,
 	 * a cold page may have to read WAL to replay it on demand.
 	 */
 	if (io_object == IOOBJECT_WAL && io_op == IOOP_READ &&
-		!enable_fast_recovery &&
+		!fast_crash_recovery &&
 		(bktype == B_WAL_RECEIVER || bktype == B_BG_WRITER ||
 		 bktype == B_AUTOVAC_LAUNCHER || bktype == B_AUTOVAC_WORKER ||
 		 bktype == B_DATACHECKSUMSWORKER_LAUNCHER ||
