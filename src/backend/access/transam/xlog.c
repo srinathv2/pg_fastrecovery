@@ -9307,6 +9307,7 @@ xlog_redo(XLogReaderState *record)
 {
 	uint8		info = XLogRecGetInfo(record) & ~XLR_INFO_MASK;
 	XLogRecPtr	lsn = record->EndRecPtr;
+
 	/*
 	 * In XLOG rmgr, backup blocks are only used by XLOG_FPI and
 	 * XLOG_FPI_FOR_HINT records.

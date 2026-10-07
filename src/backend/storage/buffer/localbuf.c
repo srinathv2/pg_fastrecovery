@@ -766,8 +766,8 @@ InitLocalBuffers(void)
 	 *
 	 * Fast crash recovery is the exception: replaying a page on demand, which
 	 * a parallel worker does when it reads one, uses local buffers as private
-	 * scratch space for the record's other pages (see LSNIndexScratchBuffer()),
-	 * never for a temporary table.
+	 * scratch space for the record's other pages (see
+	 * LSNIndexScratchBuffer()), never for a temporary table.
 	 */
 	if (IsParallelWorker() && !inReplayPageWals)
 		ereport(ERROR,

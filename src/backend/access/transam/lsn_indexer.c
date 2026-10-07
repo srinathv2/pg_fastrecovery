@@ -36,19 +36,19 @@
 #include "common/hashfn.h"
 
 /* GUC variable */
-bool fast_crash_recovery = false;
+bool		fast_crash_recovery = false;
 
 /* Control structure in traditional shared memory */
 LSNIndexControl *LSNIndexCtl = NULL;
 
 /* Per-process DSA and dshash handles (set by LSNIndexAttach) */
-static dsa_area   *lsn_dsa  = NULL;
+static dsa_area *lsn_dsa = NULL;
 static dshash_table *lsn_hash = NULL;
 
 /* State for on-demand replay; see lsn_indexer.h */
-BufferTag targetTag;
-bool inReplayPageWals = false;
-Buffer targetBuffer = InvalidBuffer;
+BufferTag	targetTag;
+bool		inReplayPageWals = false;
+Buffer		targetBuffer = InvalidBuffer;
 
 /*
  * The page this process is replaying on demand, between
@@ -77,12 +77,12 @@ static int	nscratch = 0;
  * Built-in memcmp/memhash/memcpy work fine for BufferTag.
  */
 static const dshash_parameters lsn_dsh_params = {
-	sizeof(BufferTag),					/* key_size */
-	sizeof(PageLSNEntry),				/* entry_size */
-	dshash_memcmp,						/* compare_function */
-	dshash_memhash,						/* hash_function */
-	dshash_memcpy,						/* copy_function */
-	LWTRANCHE_LSN_INDEX_HASH			/* tranche_id */
+	sizeof(BufferTag),			/* key_size */
+	sizeof(PageLSNEntry),		/* entry_size */
+	dshash_memcmp,				/* compare_function */
+	dshash_memhash,				/* hash_function */
+	dshash_memcpy,				/* copy_function */
+	LWTRANCHE_LSN_INDEX_HASH	/* tranche_id */
 };
 
 static void LSNIndexShmemRequest(void *arg);
@@ -100,15 +100,15 @@ const ShmemCallbacks LsnIndexerShmemCallbacks = {
 static void
 LSNIndexShmemRequest(void *arg)
 {
-	Size size;
+	Size		size;
 
 	size = MAXALIGN(sizeof(LSNIndexControl));
 
-	if(!fast_crash_recovery)
+	if (!fast_crash_recovery)
 		return;
 	ShmemRequestStruct(.name = "LSNIndex Ctl",
-					.size = size,
-					.ptr = (void **) &LSNIndexCtl,
+					   .size = size,
+					   .ptr = (void **) &LSNIndexCtl,
 		);
 }
 
@@ -156,7 +156,7 @@ LSNIndexShmemInit(void *arg)
 void
 LSNIndexInit(void)
 {
-	MemoryContext	oldcxt;
+	MemoryContext oldcxt;
 
 	/* Quick exit if already attached in this process. */
 	if (lsn_hash != NULL)
@@ -203,7 +203,7 @@ LSNIndexInit(void)
 void
 LSNIndexAttach(void)
 {
-	MemoryContext	oldcxt;
+	MemoryContext oldcxt;
 
 	if (lsn_hash != NULL)
 		return;					/* already attached */
@@ -258,19 +258,19 @@ LSNIndexIsActive(void)
 void
 LSNIndexAddEntry(XLogReaderState *state)
 {
-	RelFileLocator	rlocator;
-	ForkNumber		forknum;
-	BlockNumber		blkno;
-	BufferTag		tag;
-	PageLSNEntry   *entry;
-	bool			found;
+	RelFileLocator rlocator;
+	ForkNumber	forknum;
+	BlockNumber blkno;
+	BufferTag	tag;
+	PageLSNEntry *entry;
+	bool		found;
 
 	Assert(lsn_dsa != NULL && lsn_hash != NULL);
 
 	for (int blk_id = 0; blk_id <= state->record->max_block_id; blk_id++)
 	{
-		LSNNode	   *node;
-		dsa_pointer	node_dp;
+		LSNNode    *node;
+		dsa_pointer node_dp;
 
 		if (!XLogRecHasBlockRef(state, blk_id))
 			continue;
@@ -301,7 +301,8 @@ LSNIndexAddEntry(XLogReaderState *state)
 		}
 		else
 		{
-			LSNNode *tail = (LSNNode *) dsa_get_address(lsn_dsa, entry->lsn_tail);
+			LSNNode    *tail = (LSNNode *) dsa_get_address(lsn_dsa, entry->lsn_tail);
+
 			tail->next = node_dp;
 			entry->lsn_tail = node_dp;
 		}
@@ -384,12 +385,12 @@ typedef struct ForgetForkArg
 	RelFileLocator rlocator;
 	ForkNumber	forknum;
 	BlockNumber minblkno;
-} ForgetForkArg;
+}			ForgetForkArg;
 
 static bool
 match_fork_from(const BufferTag *tag, const void *arg)
 {
-	const ForgetForkArg *f = (const ForgetForkArg *) arg;
+	const		ForgetForkArg *f = (const ForgetForkArg *) arg;
 	RelFileLocator tag_rlocator = BufTagGetRelFileLocator(tag);
 
 	return RelFileLocatorEquals(tag_rlocator, f->rlocator) &&
@@ -578,9 +579,9 @@ ondemand_redo_error_callback(void *arg)
 static void
 ReplayPageRecords(BufferTag *tag, dsa_pointer head_dp)
 {
-	dsa_pointer		node_dp;
+	dsa_pointer node_dp;
 	XLogReaderState *xlogreader;
-	char		   *errormsg = NULL;
+	char	   *errormsg = NULL;
 	ErrorContextCallback errcallback;
 
 	xlogreader =
@@ -597,11 +598,11 @@ ReplayPageRecords(BufferTag *tag, dsa_pointer head_dp)
 
 	for (node_dp = head_dp;
 		 DsaPointerIsValid(node_dp);
-		 )
+		)
 	{
-		LSNNode	   *node = (LSNNode *) dsa_get_address(lsn_dsa, node_dp);
+		LSNNode    *node = (LSNNode *) dsa_get_address(lsn_dsa, node_dp);
 		XLogRecPtr	lsn = node->lsn;
-		dsa_pointer	next_dp = node->next;
+		dsa_pointer next_dp = node->next;
 
 		XLogBeginRead(xlogreader, lsn);
 		if (!XLogReadRecord(xlogreader, &errormsg))
@@ -621,10 +622,10 @@ ReplayPageRecords(BufferTag *tag, dsa_pointer head_dp)
 		/* Find the block reference matching our target tag and replay */
 		for (int blk_id = 0; blk_id <= xlogreader->record->max_block_id; blk_id++)
 		{
-			RelFileLocator	rlocator;
-			ForkNumber		forknum;
-			BlockNumber		blkno;
-			BufferTag		wal_tag;
+			RelFileLocator rlocator;
+			ForkNumber	forknum;
+			BlockNumber blkno;
+			BufferTag	wal_tag;
 
 			if (!XLogRecHasBlockRef(xlogreader, blk_id))
 				continue;
@@ -803,14 +804,14 @@ LSNIndexReplayIntoBuffer(Buffer buffer)
 
 	/*
 	 * Redo routines were written to run in the startup process and use
-	 * InRecovery to mean "applying WAL, not generating it": visibilitymap_set()
-	 * asserts it, since outside recovery setting a bit must happen in the
-	 * critical section that logs it; mdreadv() zero-fills a short read under it,
-	 * as recovery of a relation the OS crash left short requires.  On-demand
-	 * replay is that same work done later, in another process, so say so for
-	 * the duration of the redo calls.  Nothing redo does under closure consults
-	 * the flag for its other meaning, "I am the startup process": it reads no
-	 * page but the one it's handed.
+	 * InRecovery to mean "applying WAL, not generating it":
+	 * visibilitymap_set() asserts it, since outside recovery setting a bit
+	 * must happen in the critical section that logs it; mdreadv() zero-fills
+	 * a short read under it, as recovery of a relation the OS crash left
+	 * short requires.  On-demand replay is that same work done later, in
+	 * another process, so say so for the duration of the redo calls.  Nothing
+	 * redo does under closure consults the flag for its other meaning, "I am
+	 * the startup process": it reads no page but the one it's handed.
 	 */
 	save_in_recovery = InRecovery;
 	InRecovery = true;

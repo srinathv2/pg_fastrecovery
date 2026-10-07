@@ -1407,9 +1407,9 @@ ReadAndReplayPendingBuffer(Buffer buffer, SMgrRelation smgr,
 	PG_TRY();
 	{
 		/*
-		 * A read stream may call us in AIO batch mode, with IOs staged but not
-		 * submitted.  We're about to wait for other backends and to read other
-		 * pages, so submit them first; see pgaio_enter_batchmode().
+		 * A read stream may call us in AIO batch mode, with IOs staged but
+		 * not submitted.  We're about to wait for other backends and to read
+		 * other pages, so submit them first; see pgaio_enter_batchmode().
 		 */
 		pgaio_submit_staged();
 
@@ -1442,9 +1442,9 @@ ReadAndReplayPendingBuffer(Buffer buffer, SMgrRelation smgr,
 			{
 				/*
 				 * The page isn't valid, and whatever redo did to it goes.
-				 * Clear BM_DIRTY ourselves, since AbortBufferIO() insists that
-				 * a buffer that isn't valid isn't dirty either.  Waiters wake
-				 * up, find no valid page, and try again.
+				 * Clear BM_DIRTY ourselves, since AbortBufferIO() insists
+				 * that a buffer that isn't valid isn't dirty either.  Waiters
+				 * wake up, find no valid page, and try again.
 				 */
 				TerminateBufferIO(bufHdr, true, BM_IO_ERROR, true, false);
 				PG_RE_THROW();
@@ -1555,9 +1555,9 @@ StartReadBuffersImpl(ReadBuffersOperation *operation,
 		}
 
 		/*
-		 * Fast crash recovery: a page with pending WAL records must not become
-		 * valid before they're applied.  Read and replay it right here; then
-		 * it's a hit like any other.
+		 * Fast crash recovery: a page with pending WAL records must not
+		 * become valid before they're applied.  Read and replay it right
+		 * here; then it's a hit like any other.
 		 */
 		if (!found && unlikely(LSNIndexIsActive()) &&
 			operation->persistence == RELPERSISTENCE_PERMANENT)

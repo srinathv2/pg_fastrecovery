@@ -29,8 +29,9 @@
  */
 typedef struct LSNNode
 {
-	XLogRecPtr		lsn;
-	dsa_pointer		next;		/* dsa_pointer to next LSNNode, or InvalidDsaPointer */
+	XLogRecPtr	lsn;
+	dsa_pointer next;			/* dsa_pointer to next LSNNode, or
+								 * InvalidDsaPointer */
 } LSNNode;
 
 /*
@@ -39,10 +40,10 @@ typedef struct LSNNode
  */
 typedef struct PageLSNEntry
 {
-	BufferTag		tag;
-	dsa_pointer		lsn_head;	/* dsa_pointer to first LSNNode */
-	dsa_pointer		lsn_tail;	/* dsa_pointer to last LSNNode */
-	XLogRecPtr		max_lsn;
+	BufferTag	tag;
+	dsa_pointer lsn_head;		/* dsa_pointer to first LSNNode */
+	dsa_pointer lsn_tail;		/* dsa_pointer to last LSNNode */
+	XLogRecPtr	max_lsn;
 } PageLSNEntry;
 
 /*
@@ -57,10 +58,10 @@ typedef struct PageLSNEntry
  */
 typedef struct LSNIndexControl
 {
-	dsa_handle			dsa_handle;
-	dshash_table_handle	hash_handle;
-	bool				is_active;
-	pg_atomic_uint32	nreplaying;
+	dsa_handle dsa_handle;
+	dshash_table_handle hash_handle;
+	bool		is_active;
+	pg_atomic_uint32 nreplaying;
 } LSNIndexControl;
 
 /* GUC */
@@ -85,8 +86,10 @@ extern Buffer targetBuffer;
 extern Size LSNIndexShmemSize(void);
 extern void LSNIndexShmemInit(void *arg);
 
-/* Phase 2: backend-context — creates the DSA+dshash on first call,
- * attaches on subsequent calls.  Called by the startup process. */
+/*
+ * Phase 2: backend-context — creates the DSA+dshash on first call,
+ * attaches on subsequent calls.  Called by the startup process.
+ */
 extern void LSNIndexInit(void);
 
 /* Attach to an existing index — used by backends and the worker */

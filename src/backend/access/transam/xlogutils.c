@@ -386,8 +386,8 @@ XLogReadBufferForRedoExtended(XLogReaderState *record,
 
 	/*
 	 * During on-demand replay of one page, skip the record's other pages:
-	 * their own replay applies the record to them.  Callers that initialize
-	 * a page use the buffer whatever we return, so they get a scratch one.
+	 * their own replay applies the record to them.  Callers that initialize a
+	 * page use the buffer whatever we return, so they get a scratch one.
 	 */
 	if (inReplayPageWals)
 	{
@@ -463,9 +463,9 @@ XLogReadBufferForRedoExtended(XLogReaderState *record,
 				/*
 				 * A page being replayed on demand isn't valid yet, so no one
 				 * else can be looking at it, and an exclusive lock is as good
-				 * as a cleanup lock (cf. ZeroAndLockBuffer()).  A real cleanup
-				 * lock would also wait for the pins of backends that are
-				 * waiting for this very page's I/O to finish.
+				 * as a cleanup lock (cf. ZeroAndLockBuffer()).  A real
+				 * cleanup lock would also wait for the pins of backends that
+				 * are waiting for this very page's I/O to finish.
 				 */
 				if (get_cleanup_lock &&
 					!(inReplayPageWals && *buf == targetBuffer))

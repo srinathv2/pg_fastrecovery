@@ -270,7 +270,7 @@ static PMChild *StartupPMChild = NULL,
 		   *SysLoggerPMChild = NULL,
 		   *SlotSyncWorkerPMChild = NULL;
 
-PMChild *FastRecoveryWorkerPMChild = NULL;
+PMChild    *FastRecoveryWorkerPMChild = NULL;
 
 
 /* Startup process's status */
@@ -2368,6 +2368,7 @@ process_pm_child_exit(void)
 			connsAllowed = true;
 			if (fast_crash_recovery && LSNIndexIsActive())
 				FastRecoveryWorkerPMChild = StartChildProcess(B_FAST_RECOVERY_WORKER);
+
 			/*
 			 * At the next iteration of the postmaster's main loop, we will
 			 * crank up the background tasks like the autovacuum launcher and
@@ -2397,7 +2398,7 @@ process_pm_child_exit(void)
 								 _("Fast Recovery Worker process"));
 			continue;
 		}
-		
+
 		/*
 		 * Was it the bgwriter?  Normal exit can be ignored; we'll start a new
 		 * one at the next iteration of the postmaster's main loop, if

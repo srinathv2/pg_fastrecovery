@@ -43,21 +43,21 @@
 static void
 FastRecoveryMain(void)
 {
-	dshash_seq_status	seq;
-	PageLSNEntry	   *entry;
-	BufferTag		   *tags = NULL;
-	int					ntags = 0;
-	int					ncap = 0;
+	dshash_seq_status seq;
+	PageLSNEntry *entry;
+	BufferTag  *tags = NULL;
+	int			ntags = 0;
+	int			ncap = 0;
 
 	elog(LOG, "Fast recovery worker started");
 
 	LSNIndexAttach();
 
 	/*
-	 * Phase 1: snapshot all tags.  dshash_seq_next holds the partition
-	 * lock and asserts it on the next call, so we MUST NOT call
-	 * dshash_release_lock between iterations — let seq_next/term manage
-	 * the partition lock lifecycle.  We just copy the tag value out.
+	 * Phase 1: snapshot all tags.  dshash_seq_next holds the partition lock
+	 * and asserts it on the next call, so we MUST NOT call
+	 * dshash_release_lock between iterations — let seq_next/term manage the
+	 * partition lock lifecycle.  We just copy the tag value out.
 	 */
 	dshash_seq_init(&seq, lsn_hash_for_worker(), false);
 	while ((entry = (PageLSNEntry *) dshash_seq_next(&seq)) != NULL)
@@ -77,7 +77,7 @@ FastRecoveryMain(void)
 	/* Phase 2: trigger on-demand replay for each page. */
 	for (int i = 0; i < ntags; i++)
 	{
-		Buffer buffer;
+		Buffer		buffer;
 
 		/* keep up with ProcSignal barriers and config reloads */
 		ProcessMainLoopInterrupts();
@@ -121,8 +121,8 @@ FastRecoveryWorkerMain(const void *startup_data, size_t startup_data_len)
 	 *
 	 * SIGTERM is ignored on purpose.  A smart or fast shutdown must not write
 	 * its shutdown checkpoint while pages are still unrecovered, so the
-	 * postmaster waits for us to finish instead of stopping us: we are in
-	 * the set of processes it waits for in PM_WAIT_BACKENDS.  An immediate
+	 * postmaster waits for us to finish instead of stopping us: we are in the
+	 * set of processes it waits for in PM_WAIT_BACKENDS.  An immediate
 	 * shutdown uses SIGQUIT, whose handler InitPostmasterChild already set
 	 * up; it writes no checkpoint, so the next startup recovers again.
 	 */

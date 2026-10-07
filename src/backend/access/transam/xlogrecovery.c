@@ -2002,13 +2002,12 @@ ApplyWalRecord(XLogReaderState *xlogreader, XLogRecord *record, TimeLineID *repl
 
 	/*
 	 * Fast crash recovery defers only the redo of relation pages.  A record
-	 * that references blocks is indexed by page and replayed when the page
-	 * is first read.  Every other record is replayed now: it reads no
-	 * relation pages, so it is cheap, and its effect is global (transaction
-	 * status, SLRUs, which files exist, where the catalogs live), so no
-	 * later event could trigger its replay.  A record for a page that is
-	 * already in shared buffers is replayed now too; see
-	 * LSNIndexMustReplayNow().
+	 * that references blocks is indexed by page and replayed when the page is
+	 * first read.  Every other record is replayed now: it reads no relation
+	 * pages, so it is cheap, and its effect is global (transaction status,
+	 * SLRUs, which files exist, where the catalogs live), so no later event
+	 * could trigger its replay.  A record for a page that is already in
+	 * shared buffers is replayed now too; see LSNIndexMustReplayNow().
 	 */
 	if (LSNIndexIsActive() && XLogRecHasAnyBlockRefs(xlogreader) &&
 		!LSNIndexMustReplayNow(xlogreader))
