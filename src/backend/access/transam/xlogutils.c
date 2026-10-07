@@ -37,8 +37,10 @@ bool		ignore_invalid_pages = false;
 /*
  * Are we doing recovery from XLOG?
  *
- * This is only ever true in the startup process; it should be read as meaning
- * "this process is replaying WAL records", rather than "the system is in
+ * This is true in the startup process during recovery, and in any process
+ * while it replays a page's WAL on demand after a fast crash recovery (see
+ * LSNIndexReplayIntoBuffer()); it should be read as meaning "this process is
+ * replaying WAL records", rather than "the system is in
  * recovery mode".  It should be examined primarily by functions that need
  * to act differently when called from a WAL redo function (e.g., to skip WAL
  * logging).  To check whether the system is in recovery regardless of which
@@ -382,7 +384,11 @@ XLogReadBufferForRedoExtended(XLogReaderState *record,
 			 block_id);
 	}
 
-	/* During on-demand replay, skip blocks that are not the target page */
+	/*
+	 * During on-demand replay of one page, skip the record's other pages:
+	 * their own replay applies the record to them.  Callers that initialize
+	 * a page use the buffer whatever we return, so they get a scratch one.
+	 */
 	if (inReplayPageWals)
 	{
 		BufferTag	recordTag;
@@ -392,18 +398,10 @@ XLogReadBufferForRedoExtended(XLogReaderState *record,
 		if (!BufferTagsEqual(&targetTag, &recordTag))
 		{
 			if (mode == RBM_ZERO_AND_LOCK || mode == RBM_ZERO_AND_CLEANUP_LOCK)
-			{
-				bool		foundPtr;
-				SMgrRelation smgr = smgropen(rlocator, INVALID_PROC_NUMBER);
-
-				*buf = BufferDescriptorGetBuffer(LocalBufferAlloc(smgr, forknum, blkno, &foundPtr));
-				return BLK_DONE;
-			}
+				*buf = LSNIndexScratchBuffer(rlocator, forknum, blkno);
 			else
-			{
 				*buf = InvalidBuffer;
-				return BLK_DONE;
-			}
+			return BLK_DONE;
 		}
 	}
 
@@ -462,7 +460,15 @@ XLogReadBufferForRedoExtended(XLogReaderState *record,
 		{
 			if (mode != RBM_ZERO_AND_LOCK && mode != RBM_ZERO_AND_CLEANUP_LOCK)
 			{
-				if (get_cleanup_lock)
+				/*
+				 * A page being replayed on demand isn't valid yet, so no one
+				 * else can be looking at it, and an exclusive lock is as good
+				 * as a cleanup lock (cf. ZeroAndLockBuffer()).  A real cleanup
+				 * lock would also wait for the pins of backends that are
+				 * waiting for this very page's I/O to finish.
+				 */
+				if (get_cleanup_lock &&
+					!(inReplayPageWals && *buf == targetBuffer))
 					LockBufferForCleanup(*buf);
 				else
 					LockBuffer(*buf, BUFFER_LOCK_EXCLUSIVE);
@@ -516,6 +522,31 @@ XLogReadBufferExtended(RelFileLocator rlocator, ForkNumber forknum,
 	SMgrRelation smgr;
 
 	Assert(blkno != P_NEW);
+
+	/*
+	 * During on-demand replay of a page, redo reaches that page here.  Hand
+	 * it the buffer the page is being replayed into, rather than reading the
+	 * page again, which would wait for the I/O our caller holds.  Pin it once
+	 * more, because redo releases what it gets.  For the zeroing modes, zero
+	 * and lock it as the buffer manager would; an exclusive lock serves for
+	 * RBM_ZERO_AND_CLEANUP_LOCK too, because no one else can see the page.
+	 */
+	if (inReplayPageWals)
+	{
+		BufferTag	tag;
+
+		InitBufferTag(&tag, &rlocator, forknum, blkno);
+		if (BufferTagsEqual(&tag, &targetTag))
+		{
+			IncrBufferRefCount(targetBuffer);
+			if (mode == RBM_ZERO_AND_LOCK || mode == RBM_ZERO_AND_CLEANUP_LOCK)
+			{
+				memset(BufferGetPage(targetBuffer), 0, BLCKSZ);
+				LockBuffer(targetBuffer, BUFFER_LOCK_EXCLUSIVE);
+			}
+			return targetBuffer;
+		}
+	}
 
 	/* Do we have a clue where the buffer might be already? */
 	if (BufferIsValid(recent_buffer) &&

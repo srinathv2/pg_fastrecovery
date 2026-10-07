@@ -50,9 +50,10 @@ typedef struct PageLSNEntry
  * Holds handles so any process can attach to the DSA and dshash.
  *
  * is_active is set when the startup process creates the index and cleared
- * by LSNIndexFinish(), both under LSNIndexLock.  nreplaying counts processes
- * currently inside LSNIndexReplayPage(); it is only incremented while
- * holding LSNIndexLock in shared mode and seeing is_active set.
+ * by LSNIndexFinish(), both under LSNIndexLock.  nreplaying counts pages
+ * being replayed right now, between LSNIndexBeginPageReplay() and
+ * LSNIndexEndPageReplay(); it is only incremented while holding LSNIndexLock
+ * in shared mode and seeing is_active set.
  */
 typedef struct LSNIndexControl
 {
@@ -68,11 +69,17 @@ extern bool enable_fast_recovery;
 /* Shared control structure (in traditional shmem) */
 extern LSNIndexControl *LSNIndexCtl;
 
-/* Global flag: true while replay_page_wals is executing */
+/*
+ * While a page is being replayed on demand: inReplayPageWals is true,
+ * targetTag is the page, and targetBuffer the buffer it's being replayed
+ * into.  XLogReadBufferExtended() uses them to hand redo that buffer,
+ * XLogReadBufferForRedoExtended() to skip the record's other pages, and
+ * XLogRecordPageWithFreeSpace() to leave the free space map alone.  Replays
+ * never nest, so a single set of these is enough per process.
+ */
 extern bool inReplayPageWals;
-
-/* The tag currently being replayed (used to filter redo operations) */
 extern BufferTag targetTag;
+extern Buffer targetBuffer;
 
 /* Phase 1: postmaster-safe — allocates control struct in main shmem */
 extern Size LSNIndexShmemSize(void);
@@ -95,13 +102,28 @@ extern bool FastRecoveryInProgress(void);
 /* Add an entry during WAL scan (startup process) */
 extern void LSNIndexAddEntry(XLogReaderState *state);
 
+/* Must the startup process replay this record now instead of indexing it? */
+extern bool LSNIndexMustReplayNow(XLogReaderState *record);
+
 /* Forget pages removed by a drop or truncation replayed during WAL scan */
 extern void LSNIndexForgetRelation(RelFileLocator rlocator, ForkNumber forknum,
 								   BlockNumber minblkno);
 extern void LSNIndexForgetDatabase(Oid dbid);
 
-/* On-demand replay for a single page (called from ReadBuffer path) */
-extern void LSNIndexReplayPage(BufferTag *tag);
+/*
+ * On-demand replay of one page, driven by the buffer manager while it holds
+ * the page's I/O-in-progress flag (see ReadAndReplayPendingBuffer()).
+ */
+extern bool LSNIndexBeginPageReplay(const BufferTag *tag);
+extern void LSNIndexReplayIntoBuffer(Buffer buffer);
+extern void LSNIndexEndPageReplay(void);
+
+/* Drop a page's pending records: replayed, or about to be zeroed */
+extern void LSNIndexForgetPage(const BufferTag *tag);
+
+/* Scratch buffer for a page a record touches besides the one being replayed */
+extern Buffer LSNIndexScratchBuffer(RelFileLocator rlocator, ForkNumber forknum,
+									BlockNumber blkno);
 
 /* Get the dshash table pointer (for sequential scans by the worker) */
 extern dshash_table *lsn_hash_for_worker(void);

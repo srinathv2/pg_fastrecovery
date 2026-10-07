@@ -351,6 +351,7 @@ static bool read_tablespace_map(List **tablespaces);
 static void xlogrecovery_redo(XLogReaderState *record, TimeLineID replayTLI);
 static void CheckRecoveryConsistency(void);
 static void rm_redo_error_callback(void *arg);
+static void MaybeStartFastRecovery(void);
 #ifdef WAL_DEBUG
 static void xlog_outrec(StringInfo buf, XLogReaderState *record);
 #endif
@@ -416,6 +417,31 @@ XLogRecoveryShmemInit(void *arg)
 	SpinLockInit(&XLogRecoveryCtl->info_lck);
 	InitSharedLatch(&XLogRecoveryCtl->recoveryWakeupLatch);
 	ConditionVariableInit(&XLogRecoveryCtl->recoveryNotPausedCV);
+}
+
+/*
+ * Start fast crash recovery, if it's enabled and applies.
+ *
+ * It applies to crash recovery under the postmaster only.  Archive recovery
+ * and standby mode replay WAL that has no end, so the index would never be
+ * drained and restartpoints never allowed; single-user mode has no worker to
+ * drain it either.  Those replay WAL the usual way.
+ */
+static void
+MaybeStartFastRecovery(void)
+{
+	if (!enable_fast_recovery)
+		return;
+
+	if (ArchiveRecoveryRequested || !IsUnderPostmaster)
+	{
+		ereport(LOG,
+				(errmsg("fast crash recovery is not used in %s; replaying WAL normally",
+						ArchiveRecoveryRequested ? "archive recovery or standby mode" : "single-user mode")));
+		return;
+	}
+
+	LSNIndexInit();
 }
 
 /*
@@ -877,14 +903,12 @@ InitWalRecovery(ControlFileData *ControlFile, bool *wasShutdown_ptr,
 			ereport(PANIC,
 					(errmsg("invalid redo record in shutdown checkpoint")));
 		InRecovery = true;
-		if (enable_fast_recovery)
-			LSNIndexInit();
+		MaybeStartFastRecovery();
 	}
 	else if (ControlFile->state != DB_SHUTDOWNED)
 	{
 		InRecovery = true;
-		if (enable_fast_recovery)
-			LSNIndexInit();
+		MaybeStartFastRecovery();
 	}
 	else if (ArchiveRecoveryRequested)
 	{
@@ -1982,9 +2006,12 @@ ApplyWalRecord(XLogReaderState *xlogreader, XLogRecord *record, TimeLineID *repl
 	 * is first read.  Every other record is replayed now: it reads no
 	 * relation pages, so it is cheap, and its effect is global (transaction
 	 * status, SLRUs, which files exist, where the catalogs live), so no
-	 * later event could trigger its replay.
+	 * later event could trigger its replay.  A record for a page that is
+	 * already in shared buffers is replayed now too; see
+	 * LSNIndexMustReplayNow().
 	 */
-	if (LSNIndexIsActive() && XLogRecHasAnyBlockRefs(xlogreader))
+	if (LSNIndexIsActive() && XLogRecHasAnyBlockRefs(xlogreader) &&
+		!LSNIndexMustReplayNow(xlogreader))
 		LSNIndexAddEntry(xlogreader);
 	else
 	{

@@ -32,7 +32,7 @@
  *
  * IMPORTANT: dshash_seq_next holds the partition LWLock until the next
  * call, term, or partition crossing.  ReadBufferWithoutRelcache below
- * triggers LSNIndexReplayPage, which calls dshash_find() — that would
+ * triggers on-demand replay, which calls dshash_find() — that would
  * try to re-acquire the SAME partition lock and self-deadlock (LWLocks
  * are not reentrant).
  *

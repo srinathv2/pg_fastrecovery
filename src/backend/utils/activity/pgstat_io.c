@@ -529,7 +529,7 @@ pgstat_tracks_io_op(BackendType bktype, IOObject io_object,
 	/*
 	 * Some BackendTypes do not perform reads with IOOBJECT_WAL — except
 	 * when fast crash recovery is on, in which case any backend that hits
-	 * a cold page may have to read WAL via LSNIndexReplayPage().
+	 * a cold page may have to read WAL to replay it on demand.
 	 */
 	if (io_object == IOOBJECT_WAL && io_op == IOOP_READ &&
 		!enable_fast_recovery &&

@@ -6549,10 +6549,14 @@ StartupXLOG(void)
 		 * We're all set for replaying the WAL now. Do it.
 		 */
 		PerformWalRecovery();
-		if(!enable_fast_recovery)
-			performedWalRecovery = true;
-		else
-			performedWalRecovery = false;
+
+		/*
+		 * With fast crash recovery active, WAL has been scanned but not
+		 * applied: the end-of-recovery checkpoint and the other work that
+		 * follows a completed replay are for the fast recovery worker to
+		 * request once every page has been recovered.
+		 */
+		performedWalRecovery = !LSNIndexIsActive();
 	}
 	else
 		performedWalRecovery = false;

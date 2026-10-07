@@ -15,16 +15,20 @@
 
 #include "access/xlog.h"
 #include "access/xlogreader.h"
+#include "access/xlogrecovery.h"
 #include "access/xlog_internal.h"
 #include "access/xlogutils.h"
 #include "access/lsn_indexer.h"
+#include "common/relpath.h"
 #include "lib/dshash.h"
+#include "lib/stringinfo.h"
 #include "miscadmin.h"
 #include "storage/buf_internals.h"
 #include "storage/bufmgr.h"
 #include "storage/latch.h"
 #include "storage/lwlock.h"
 #include "storage/shmem.h"
+#include "storage/smgr.h"
 #include "utils/dsa.h"
 #include "utils/hsearch.h"
 #include "utils/memutils.h"
@@ -41,9 +45,30 @@ LSNIndexControl *LSNIndexCtl = NULL;
 static dsa_area   *lsn_dsa  = NULL;
 static dshash_table *lsn_hash = NULL;
 
-/* State for on-demand replay */
+/* State for on-demand replay; see lsn_indexer.h */
 BufferTag targetTag;
 bool inReplayPageWals = false;
+Buffer targetBuffer = InvalidBuffer;
+
+/*
+ * The page this process is replaying on demand, between
+ * LSNIndexBeginPageReplay() and LSNIndexEndPageReplay().  Replays never
+ * nest: redo of an indexed page touches no other page (see
+ * LSNIndexBeginPageReplay()), so one slot is enough.
+ */
+static bool replay_begun = false;
+static BufferTag replaying_tag;
+
+/* Have we run RmgrStartup() for on-demand replay in this process? */
+static bool rmgrs_started = false;
+
+/*
+ * Scratch buffers handed out for the current record's other pages; dropped
+ * once the record has been replayed.  A record references at most
+ * XLR_MAX_BLOCK_ID + 1 blocks.
+ */
+static BufferTag scratch_tags[XLR_MAX_BLOCK_ID + 1];
+static int	nscratch = 0;
 
 /*
  * dshash parameters for the LSN index.
@@ -71,19 +96,6 @@ const ShmemCallbacks LsnIndexerShmemCallbacks = {
  *  Shared-memory sizing and initialisation
  * ----------------------------------------------------------------
  */
-
-// /*
-//  * LSNIndexShmemSize - size for the fixed-size control struct only.
-//  *
-//  * The DSA/dshash that hold the per-page LSN lists are NOT in main shmem;
-//  * they live in DSM segments allocated lazily by the startup process.
-//  * See LSNIndexInit().
-//  */
-// Size
-// LSNIndexShmemSize(void)
-// {
-// 	return MAXALIGN(sizeof(LSNIndexControl));
-// }
 
 static void
 LSNIndexShmemRequest(void *arg)
@@ -322,13 +334,28 @@ LSNIndexAddEntry(XLogReaderState *state)
  * workload dropping many relations would want a per-relation list of the
  * blocks in the index.
  *
- * XXX A truncation also clears the tail of the last surviving FSM and VM
- * page.  That page keeps its pending records, and replaying them later
- * re-applies pre-truncation state to the cleared tail.  Closing this needs
- * the page to be replayed up to the truncation before it is applied.
+ * A truncation also clears the tail of the last surviving FSM and VM page.
+ * To do so it reads that page through the buffer manager, which replays its
+ * pending records first, up to the truncation; and from then on the page is
+ * in shared buffers, so LSNIndexMustReplayNow() has later records for it
+ * applied right away.
  */
 
 typedef bool (*ForgetMatchFn) (const BufferTag *tag, const void *arg);
+
+/* Free a page's list of LSNs. */
+static void
+free_lsn_list(dsa_pointer node_dp)
+{
+	while (DsaPointerIsValid(node_dp))
+	{
+		dsa_pointer next_dp;
+
+		next_dp = ((LSNNode *) dsa_get_address(lsn_dsa, node_dp))->next;
+		dsa_free(lsn_dsa, node_dp);
+		node_dp = next_dp;
+	}
+}
 
 static int
 forget_matching_pages(ForgetMatchFn match, const void *arg)
@@ -340,21 +367,10 @@ forget_matching_pages(ForgetMatchFn match, const void *arg)
 	dshash_seq_init(&seq, lsn_hash, true);
 	while ((entry = (PageLSNEntry *) dshash_seq_next(&seq)) != NULL)
 	{
-		dsa_pointer node_dp;
-
 		if (!match(&entry->tag, arg))
 			continue;
 
-		/* free the page's list of LSNs, then the entry itself */
-		node_dp = entry->lsn_head;
-		while (DsaPointerIsValid(node_dp))
-		{
-			dsa_pointer next_dp;
-
-			next_dp = ((LSNNode *) dsa_get_address(lsn_dsa, node_dp))->next;
-			dsa_free(lsn_dsa, node_dp);
-			node_dp = next_dp;
-		}
+		free_lsn_list(entry->lsn_head);
 		dshash_delete_current(&seq);
 		nforgotten++;
 	}
@@ -436,10 +452,125 @@ LSNIndexForgetDatabase(Oid dbid)
 			 nforgotten, dbid);
 }
 
+/*
+ * LSNIndexMustReplayNow - should the startup process replay this record now,
+ * instead of indexing it?
+ *
+ * Yes if it touches a page that's already in shared buffers.  During the
+ * scan, a page gets there only when an eagerly replayed record reads it (a
+ * truncation reads the last surviving FSM and VM page, say), and reading it
+ * replays its indexed records up to the current position.  From then on it
+ * has to be kept current, as in normal recovery: an entry indexed for it now
+ * would never be replayed, since the page isn't read from disk again while
+ * it stays in the buffer pool.  Replaying such a record can read its other
+ * pages too, which then stay current the same way.
+ *
+ * Also yes for init forks of unlogged relations: at the end of recovery they
+ * are copied to the main fork without going through shared buffers, so they
+ * must be on disk by then.
+ */
+bool
+LSNIndexMustReplayNow(XLogReaderState *record)
+{
+	for (int block_id = 0; block_id <= record->record->max_block_id; block_id++)
+	{
+		RelFileLocator rlocator;
+		ForkNumber	forknum;
+		BlockNumber blkno;
+		BufferTag	tag;
+		uint32		hash;
+		LWLock	   *partitionLock;
+		int			buf_id;
+
+		if (!XLogRecHasBlockRef(record, block_id))
+			continue;
+
+		XLogRecGetBlockTag(record, block_id, &rlocator, &forknum, &blkno);
+		if (forknum == INIT_FORKNUM)
+			return true;
+
+		InitBufferTag(&tag, &rlocator, forknum, blkno);
+		hash = BufTableHashCode(&tag);
+		partitionLock = BufMappingPartitionLock(hash);
+		LWLockAcquire(partitionLock, LW_SHARED);
+		buf_id = BufTableLookup(&tag, hash);
+		LWLockRelease(partitionLock);
+
+		if (buf_id >= 0)
+			return true;
+	}
+
+	return false;
+}
+
 /* ----------------------------------------------------------------
  *  On-demand WAL replay for a single page
  * ----------------------------------------------------------------
  */
+
+/*
+ * LSNIndexScratchBuffer - a throwaway buffer for one of the current record's
+ * other pages.
+ *
+ * While a page is replayed on demand, the record's other pages are skipped:
+ * their own replay applies the record to them.  Redo routines that
+ * initialize such a page still need a buffer to write into, so give them a
+ * local one, and drop it as soon as the record is done, before it could ever
+ * be written out under the other page's identity.
+ */
+Buffer
+LSNIndexScratchBuffer(RelFileLocator rlocator, ForkNumber forknum,
+					  BlockNumber blkno)
+{
+	SMgrRelation smgr = smgropen(rlocator, INVALID_PROC_NUMBER);
+	BufferDesc *bufHdr;
+	bool		found;
+
+	if (nscratch >= lengthof(scratch_tags))
+		elog(ERROR, "too many scratch buffers for one WAL record");
+
+	bufHdr = LocalBufferAlloc(smgr, forknum, blkno, &found);
+	InitBufferTag(&scratch_tags[nscratch++], &rlocator, forknum, blkno);
+
+	return BufferDescriptorGetBuffer(bufHdr);
+}
+
+/* Drop the scratch buffers handed out so far. */
+static void
+drop_scratch_buffers(void)
+{
+	for (int i = 0; i < nscratch; i++)
+	{
+		RelFileLocator rlocator = BufTagGetRelFileLocator(&scratch_tags[i]);
+		ForkNumber	forknum = BufTagGetForkNum(&scratch_tags[i]);
+		BlockNumber blkno = scratch_tags[i].blockNum;
+
+		DropRelationLocalBuffers(rlocator, &forknum, 1, &blkno);
+	}
+	nscratch = 0;
+}
+
+/*
+ * Error context for on-demand replay, like rm_redo_error_callback() in normal
+ * recovery: name the record, and the page being recovered.
+ */
+static void
+ondemand_redo_error_callback(void *arg)
+{
+	XLogReaderState *record = (XLogReaderState *) arg;
+	StringInfoData buf;
+
+	initStringInfo(&buf);
+	xlog_outdesc(&buf, record);
+
+	errcontext("on-demand WAL redo at %X/%08X for %s, recovering block %u of relation %s",
+			   LSN_FORMAT_ARGS(record->ReadRecPtr), buf.data,
+			   targetTag.blockNum,
+			   relpathperm(BufTagGetRelFileLocator(&targetTag),
+						   BufTagGetForkNum(&targetTag)).str);
+
+	pfree(buf.data);
+}
 
 /*
  * Replay, in LSN order, the indexed records that touch the page 'tag'.
@@ -450,11 +581,7 @@ ReplayPageRecords(BufferTag *tag, dsa_pointer head_dp)
 	dsa_pointer		node_dp;
 	XLogReaderState *xlogreader;
 	char		   *errormsg = NULL;
-
-	RmgrStartup();
-
-	inReplayPageWals = true;
-	targetTag = *tag;
+	ErrorContextCallback errcallback;
 
 	xlogreader =
 		XLogReaderAllocate(wal_segment_size, NULL,
@@ -507,7 +634,17 @@ ReplayPageRecords(BufferTag *tag, dsa_pointer head_dp)
 
 			if (BufferTagsEqual(tag, &wal_tag))
 			{
-				RmgrTable[XLogRecGetRmid(xlogreader)].rm_redo(xlogreader);
+				errcallback.callback = ondemand_redo_error_callback;
+				errcallback.arg = (void *) xlogreader;
+				errcallback.previous = error_context_stack;
+				error_context_stack = &errcallback;
+
+				GetRmgr(XLogRecGetRmid(xlogreader)).rm_redo(xlogreader);
+
+				error_context_stack = errcallback.previous;
+
+				/* the record is in; its other pages' scratch buffers can go */
+				drop_scratch_buffers();
 				break;
 			}
 		}
@@ -516,83 +653,216 @@ ReplayPageRecords(BufferTag *tag, dsa_pointer head_dp)
 	}
 
 	XLogReaderFree(xlogreader);
-	RmgrCleanup();
 }
 
 /*
- * Register this process as replaying a page, unless fast recovery is over.
+ * Start rmgr-specific recovery state for on-demand replay, once per process.
  *
- * From here until LSNIndexEndReplay(), FastRecoveryInProgress() counts us,
- * which keeps a checkpoint from starting while the page we are replaying has
- * not been dirtied yet.  We check is_active and increment the counter under
- * LSNIndexLock, so LSNIndexFinish(), which clears is_active under the same
- * lock in exclusive mode, sees every replay that got in.
+ * The startup process has its own, set up by PerformWalRecovery(), and must
+ * not call RmgrStartup() again: gin, gist and spgist keep a static memory
+ * context that their startup creates and their cleanup deletes, so a nested
+ * call would pull it out from under the scan.  Anywhere else, start them
+ * once, in TopMemoryContext so that the contexts outlive the query that
+ * happened to read the first page, and keep them until the process exits.
  */
-static bool
-LSNIndexBeginReplay(void)
+static void
+StartRmgrsForOnDemandReplay(void)
 {
-	bool		active;
+	MemoryContext oldcxt;
 
-	if (LSNIndexCtl == NULL)
-		return false;
+	if (rmgrs_started || AmStartupProcess())
+		return;
 
-	LWLockAcquire(LSNIndexLock, LW_SHARED);
-	active = LSNIndexCtl->is_active;
-	if (active)
-		pg_atomic_fetch_add_u32(&LSNIndexCtl->nreplaying, 1);
-	LWLockRelease(LSNIndexLock);
-
-	return active;
+	oldcxt = MemoryContextSwitchTo(TopMemoryContext);
+	RmgrStartup();
+	MemoryContextSwitchTo(oldcxt);
+	rmgrs_started = true;
 }
 
-static void
-LSNIndexEndReplay(void)
+/*
+ * LSNIndexBeginPageReplay - does this page have pending records?  If so,
+ * register us as replaying it.
+ *
+ * Called by the buffer manager for a page it's about to read from disk.  On
+ * false, there's nothing to replay: read the page as usual.  On true, the
+ * caller must read the page, replay it, mark it valid, and in any case call
+ * LSNIndexEndPageReplay().  Until then FastRecoveryInProgress() counts us,
+ * so no checkpoint can start before the page is valid and dirty.
+ *
+ * is_active is checked and the counter bumped under LSNIndexLock, so
+ * LSNIndexFinish(), which clears is_active under the same lock in exclusive
+ * mode, sees every replay that got in.
+ *
+ * Replays never nest.  Redo of an indexed page reaches that page through
+ * XLogReadBufferExtended(), which hands it the buffer being replayed into;
+ * the record's other pages are skipped by XLogReadBufferForRedoExtended(),
+ * and the free space map is left alone by XLogRecordPageWithFreeSpace().  So
+ * nothing redo does can bring us back here, and a read that does is a bug: it
+ * would wait forever for the I/O we hold if it's the same page, or replay
+ * another page inside this one's redo if not.  (The startup process can get
+ * here from its own, eager redo of a record that touches an indexed page;
+ * that's one level, not nesting, since the replay it starts reads nothing.)
+ */
+bool
+LSNIndexBeginPageReplay(const BufferTag *tag)
 {
-	inReplayPageWals = false;
+	PageLSNEntry *entry;
+	bool		pending = false;
+
+	if (LSNIndexCtl == NULL || !LSNIndexCtl->is_active)
+		return false;
+
+	/* Attach before taking LSNIndexLock: LSNIndexAttach() takes it too. */
+	if (lsn_hash == NULL)
+		LSNIndexAttach();
+	if (lsn_hash == NULL)
+		return false;
+
+	if (replay_begun)
+		elog(ERROR, "block %u of relation %s read during on-demand replay of block %u of relation %s",
+			 tag->blockNum,
+			 relpathperm(BufTagGetRelFileLocator(tag),
+						 BufTagGetForkNum(tag)).str,
+			 replaying_tag.blockNum,
+			 relpathperm(BufTagGetRelFileLocator(&replaying_tag),
+						 BufTagGetForkNum(&replaying_tag)).str);
+
+	LWLockAcquire(LSNIndexLock, LW_SHARED);
+	if (LSNIndexCtl->is_active)
+	{
+		entry = (PageLSNEntry *) dshash_find(lsn_hash, tag, false);
+		if (entry != NULL)
+		{
+			dshash_release_lock(lsn_hash, entry);
+			pg_atomic_fetch_add_u32(&LSNIndexCtl->nreplaying, 1);
+			pending = true;
+		}
+	}
+	LWLockRelease(LSNIndexLock);
+
+	if (pending)
+	{
+		replay_begun = true;
+		replaying_tag = *tag;
+	}
+
+	return pending;
+}
+
+/*
+ * LSNIndexEndPageReplay - undo LSNIndexBeginPageReplay().
+ */
+void
+LSNIndexEndPageReplay(void)
+{
+	Assert(replay_begun);
+	replay_begun = false;
 	pg_atomic_fetch_sub_u32(&LSNIndexCtl->nreplaying, 1);
 }
 
 /*
- * LSNIndexReplayPage - replay the pending WAL records of one page.
+ * LSNIndexReplayIntoBuffer - apply a page's pending records to its buffer.
  *
- * Called from the buffer read path.  If redo fails, the PG_FINALLY block
- * still unregisters us; a leaked count would block checkpoints until the
- * next restart.
+ * The caller holds 'buffer' pinned and its I/O-in-progress flag, and has
+ * just read the page from disk into it.  Nobody else can see the page until
+ * the caller marks it valid, so redo needs no lock to keep readers out, and
+ * nobody can be holding a pointer into the page.  Redo reaches this page
+ * through XLogReadBufferExtended(), which hands it this buffer instead of
+ * reading the page again; the record's other pages are skipped, because
+ * their own replay applies the record to them.
  */
 void
-LSNIndexReplayPage(BufferTag *tag)
+LSNIndexReplayIntoBuffer(Buffer buffer)
 {
-	if (!enable_fast_recovery || !LSNIndexBeginReplay())
-		return;
+	BufferTag	tag = GetBufferDescriptor(buffer - 1)->tag;
+	PageLSNEntry *entry;
+	dsa_pointer head_dp;
+	bool		save_in_recovery;
 
+	Assert(replay_begun && BufferTagsEqual(&replaying_tag, &tag));
+	Assert(!inReplayPageWals);
+
+	/*
+	 * Scratch buffers left over by a replay that failed: their pins are gone
+	 * with the aborted transaction, so they can go now.
+	 */
+	if (nscratch > 0)
+		drop_scratch_buffers();
+
+	/* Only the process holding the page's I/O retires its entry: us. */
+	entry = (PageLSNEntry *) dshash_find(lsn_hash, &tag, false);
+	if (entry == NULL)
+		elog(ERROR, "no pending WAL records for block %u of relation %s",
+			 tag.blockNum,
+			 relpathperm(BufTagGetRelFileLocator(&tag),
+						 BufTagGetForkNum(&tag)).str);
+	head_dp = entry->lsn_head;
+	dshash_release_lock(lsn_hash, entry);
+
+	StartRmgrsForOnDemandReplay();
+
+	/*
+	 * Redo routines were written to run in the startup process and use
+	 * InRecovery to mean "applying WAL, not generating it": visibilitymap_set()
+	 * asserts it, since outside recovery setting a bit must happen in the
+	 * critical section that logs it; mdreadv() zero-fills a short read under it,
+	 * as recovery of a relation the OS crash left short requires.  On-demand
+	 * replay is that same work done later, in another process, so say so for
+	 * the duration of the redo calls.  Nothing redo does under closure consults
+	 * the flag for its other meaning, "I am the startup process": it reads no
+	 * page but the one it's handed.
+	 */
+	save_in_recovery = InRecovery;
+	InRecovery = true;
+	inReplayPageWals = true;
+	targetTag = tag;
+	targetBuffer = buffer;
 	PG_TRY();
 	{
-		PageLSNEntry *entry = NULL;
-
-		/*
-		 * Attach lazily.  Our registration keeps the index from being freed
-		 * under us.  If LSNIndexFinish() cleared is_active after we
-		 * registered, LSNIndexAttach() does nothing and we skip the page:
-		 * the worker has already replayed every page in the index.
-		 */
-		if (lsn_hash == NULL)
-			LSNIndexAttach();
-		if (lsn_hash != NULL)
-			entry = (PageLSNEntry *) dshash_find(lsn_hash, tag, false);
-
-		if (entry != NULL)
-		{
-			dsa_pointer head_dp = entry->lsn_head;
-
-			dshash_release_lock(lsn_hash, entry);
-			ReplayPageRecords(tag, head_dp);
-		}
+		ReplayPageRecords(&tag, head_dp);
 	}
 	PG_FINALLY();
 	{
-		LSNIndexEndReplay();
+		inReplayPageWals = false;
+		targetBuffer = InvalidBuffer;
+		InRecovery = save_in_recovery;
 	}
 	PG_END_TRY();
+}
+
+/*
+ * LSNIndexForgetPage - drop a page's pending records.
+ *
+ * Called once a replayed page has been marked valid: a valid page is
+ * current, and must never be replayed again (a full-page image in its list
+ * would roll it back).  Also called when a page is about to be zeroed for
+ * reuse, as its old records no longer apply.  The caller holds the buffer
+ * pinned, so the page can't be evicted and read back in before we're done.
+ */
+void
+LSNIndexForgetPage(const BufferTag *tag)
+{
+	PageLSNEntry *entry;
+
+	if (LSNIndexCtl == NULL || !LSNIndexCtl->is_active)
+		return;
+	if (lsn_hash == NULL)
+		LSNIndexAttach();
+	if (lsn_hash == NULL)
+		return;
+
+	/* is_active, seen under the lock, keeps LSNIndexFinish() from freeing it */
+	LWLockAcquire(LSNIndexLock, LW_SHARED);
+	if (LSNIndexCtl->is_active)
+	{
+		entry = (PageLSNEntry *) dshash_find(lsn_hash, tag, true);
+		if (entry != NULL)
+		{
+			free_lsn_list(entry->lsn_head);
+			dshash_delete_entry(lsn_hash, entry);
+		}
+	}
+	LWLockRelease(LSNIndexLock);
 }
 
 /* ----------------------------------------------------------------
