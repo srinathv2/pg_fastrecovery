@@ -287,7 +287,6 @@
 # - Prefetching during recovery -
 
 #recovery_prefetch = try        # prefetch pages referenced in the WAL?
-#fast_crash_recovery = off		# replay WAL on demand after a crash, not before
 #wal_decode_buffer_size = 512kB # lookahead window used for prefetching
                                 # (change requires restart)
 
@@ -347,6 +346,9 @@
 
 # - Fast Recovery -
 
+#fast_crash_recovery = off      # replay WAL on demand after a crash,
+                                # instead of before accepting connections
+                                # (change requires restart)
 
 #------------------------------------------------------------------------------
 # REPLICATION
