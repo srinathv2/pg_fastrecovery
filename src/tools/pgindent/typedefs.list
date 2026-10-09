@@ -892,8 +892,6 @@ ForeignServer
 ForeignServerInfo
 ForeignTable
 ForeignTruncateInfo
-ForgetForkArg
-ForgetMatchFn
 ForkNumber
 FormData_pg_aggregate
 FormData_pg_am

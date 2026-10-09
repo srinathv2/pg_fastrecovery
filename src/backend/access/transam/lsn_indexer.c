@@ -375,8 +375,6 @@ LSNIndexAddEntry(XLogReaderState *state)
  * see LSNIndexPrepareToDefer() for what happens then.
  */
 
-typedef bool (*ForgetMatchFn) (const BufferTag *tag, const void *arg);
-
 /* Free a page's list of LSNs. */
 static void
 free_lsn_list(dsa_pointer node_dp)
@@ -391,74 +389,41 @@ free_lsn_list(dsa_pointer node_dp)
 	}
 }
 
-static int
-forget_matching_pages(ForgetMatchFn match, const void *arg)
-{
-	dshash_seq_status seq;
-	PageLSNEntry *entry;
-	int			nforgotten = 0;
-
-	dshash_seq_init(&seq, lsn_hash, true);
-	while ((entry = (PageLSNEntry *) dshash_seq_next(&seq)) != NULL)
-	{
-		if (!match(&entry->tag, arg))
-			continue;
-
-		free_lsn_list(entry->lsn_head);
-		dshash_delete_current(&seq);
-		nforgotten++;
-	}
-	dshash_seq_term(&seq);
-
-	return nforgotten;
-}
-
-typedef struct ForgetForkArg
-{
-	RelFileLocator rlocator;
-	ForkNumber	forknum;
-	BlockNumber minblkno;
-} ForgetForkArg;
-
-static bool
-match_fork_from(const BufferTag *tag, const void *arg)
-{
-	const ForgetForkArg *f = (const ForgetForkArg *) arg;
-	RelFileLocator tag_rlocator = BufTagGetRelFileLocator(tag);
-
-	return RelFileLocatorEquals(tag_rlocator, f->rlocator) &&
-		BufTagGetForkNum(tag) == f->forknum &&
-		tag->blockNum >= f->minblkno;
-}
-
-static bool
-match_database(const BufferTag *tag, const void *arg)
-{
-	return tag->dbOid == *(const Oid *) arg;
-}
-
 /*
  * LSNIndexForgetRelation - forget the pages of a relation fork from block
  * 'minblkno' on.
  *
  * Called from XLogDropRelation() with 0 and from XLogTruncateRelation() with
- * the new length, next to forgetting the fork's invalid pages.
+ * the new length, next to forgetting the fork's invalid pages (compare
+ * forget_invalid_pages() in xlogutils.c).
  */
 void
 LSNIndexForgetRelation(RelFileLocator rlocator, ForkNumber forknum,
 					   BlockNumber minblkno)
 {
-	ForgetForkArg arg;
-	int			nforgotten;
+	dshash_seq_status seq;
+	PageLSNEntry *entry;
+	int			nforgotten = 0;
 
 	/* Only while the index is being built, by the process building it. */
 	if (lsn_hash == NULL || !InRecovery)
 		return;
 
-	arg.rlocator = rlocator;
-	arg.forknum = forknum;
-	arg.minblkno = minblkno;
-	nforgotten = forget_matching_pages(match_fork_from, &arg);
+	dshash_seq_init(&seq, lsn_hash, true);
+	while ((entry = (PageLSNEntry *) dshash_seq_next(&seq)) != NULL)
+	{
+		RelFileLocator tag_rlocator = BufTagGetRelFileLocator(&entry->tag);
+
+		if (RelFileLocatorEquals(tag_rlocator, rlocator) &&
+			BufTagGetForkNum(&entry->tag) == forknum &&
+			entry->tag.blockNum >= minblkno)
+		{
+			free_lsn_list(entry->lsn_head);
+			dshash_delete_current(&seq);
+			nforgotten++;
+		}
+	}
+	dshash_seq_term(&seq);
 
 	if (nforgotten > 0)
 		elog(DEBUG1, "fast recovery: forgot %d pages of relation %u/%u/%u fork %d from block %u",
@@ -469,17 +434,29 @@ LSNIndexForgetRelation(RelFileLocator rlocator, ForkNumber forknum,
 /*
  * LSNIndexForgetDatabase - forget every page of a database.
  *
- * Called from XLogDropDatabase().
+ * Called from XLogDropDatabase() (compare forget_invalid_pages_db()).
  */
 void
 LSNIndexForgetDatabase(Oid dbid)
 {
-	int			nforgotten;
+	dshash_seq_status seq;
+	PageLSNEntry *entry;
+	int			nforgotten = 0;
 
 	if (lsn_hash == NULL || !InRecovery)
 		return;
 
-	nforgotten = forget_matching_pages(match_database, &dbid);
+	dshash_seq_init(&seq, lsn_hash, true);
+	while ((entry = (PageLSNEntry *) dshash_seq_next(&seq)) != NULL)
+	{
+		if (entry->tag.dbOid == dbid)
+		{
+			free_lsn_list(entry->lsn_head);
+			dshash_delete_current(&seq);
+			nforgotten++;
+		}
+	}
+	dshash_seq_term(&seq);
 
 	if (nforgotten > 0)
 		elog(DEBUG1, "fast recovery: forgot %d pages of dropped database %u",
