@@ -1901,6 +1901,9 @@ PerformWalRecovery(void)
 					(errmsg("last completed transaction was at log time %s",
 							timestamptz_to_str(xtime))));
 
+		if (LSNIndexIsActive())
+			LSNIndexLogScanSummary();
+
 		InRedo = false;
 	}
 	else
@@ -2008,11 +2011,12 @@ ApplyWalRecord(XLogReaderState *xlogreader, XLogRecord *record, TimeLineID *repl
 	 * first read.  Every other record is replayed now: it reads no relation
 	 * pages, so it is cheap, and its effect is global (transaction status,
 	 * SLRUs, which files exist, where the catalogs live), so no later event
-	 * could trigger its replay.  A record for a page that is already in
-	 * shared buffers is replayed now too; see LSNIndexMustReplayNow().
+	 * could trigger its replay.  A page that such a record read into shared
+	 * buffers is evicted before a record for it is indexed; see
+	 * LSNIndexPrepareToDefer().
 	 */
 	if (LSNIndexIsActive() && XLogRecHasAnyBlockRefs(xlogreader) &&
-		!LSNIndexMustReplayNow(xlogreader))
+		LSNIndexPrepareToDefer(xlogreader))
 	{
 		LSNIndexAddEntry(xlogreader);
 		deferred = true;

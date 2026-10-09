@@ -105,8 +105,11 @@ extern bool FastRecoveryInProgress(void);
 /* Add an entry during WAL scan (startup process) */
 extern void LSNIndexAddEntry(XLogReaderState *state);
 
-/* Must the startup process replay this record now instead of indexing it? */
-extern bool LSNIndexMustReplayNow(XLogReaderState *record);
+/* May the startup process index this record?  Evicts resident pages for it. */
+extern bool LSNIndexPrepareToDefer(XLogReaderState *record);
+
+/* Report what the scan did, once it is over */
+extern void LSNIndexLogScanSummary(void);
 
 /* Forget pages removed by a drop or truncation replayed during WAL scan */
 extern void LSNIndexForgetRelation(RelFileLocator rlocator, ForkNumber forknum,

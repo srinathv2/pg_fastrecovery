@@ -892,6 +892,8 @@ ForeignServer
 ForeignServerInfo
 ForeignTable
 ForeignTruncateInfo
+ForgetForkArg
+ForgetMatchFn
 ForkNumber
 FormData_pg_aggregate
 FormData_pg_am
@@ -1701,6 +1703,8 @@ LogicalSlotInfoArr
 LogicalTape
 LogicalTapeSet
 LookupSet
+LSNIndexControl
+LSNNode
 LsnReadQueue
 LsnReadQueueNextFun
 LsnReadQueueNextStatus
@@ -1905,6 +1909,7 @@ OutputPluginOutputType
 OverridingKind
 PACE_HEADER
 PACL
+PageLSNEntry
 PATH
 PCtxtHandle
 PERL_CONTEXT

@@ -70,6 +70,13 @@ static bool rmgrs_started = false;
 static BufferTag scratch_tags[XLR_MAX_BLOCK_ID + 1];
 static int	nscratch = 0;
 
+/* What the scan did; reported by LSNIndexLogScanSummary() */
+static int64 scan_records_indexed = 0;
+static int64 scan_pages_indexed = 0;
+static int64 scan_records_replayed = 0; /* with block references */
+static int64 scan_pages_evicted = 0;
+static int64 scan_blocks_extended = 0;
+
 /*
  * dshash parameters for the LSN index.
  *
@@ -296,7 +303,10 @@ LSNIndexAddEntry(XLogReaderState *state)
 		smgrcreate(smgr, forknum, true);
 		nblocks = smgrnblocks(smgr, forknum);
 		if (blkno >= nblocks)
+		{
 			smgrzeroextend(smgr, forknum, nblocks, blkno - nblocks + 1, false);
+			scan_blocks_extended += blkno - nblocks + 1;
+		}
 
 		entry = (PageLSNEntry *) dshash_find_or_insert(lsn_hash, &tag, &found);
 
@@ -305,6 +315,7 @@ LSNIndexAddEntry(XLogReaderState *state)
 			entry->lsn_head = InvalidDsaPointer;
 			entry->lsn_tail = InvalidDsaPointer;
 			entry->max_lsn = InvalidXLogRecPtr;
+			scan_pages_indexed++;
 		}
 
 		/* Allocate a new LSNNode in DSA memory */
@@ -333,6 +344,8 @@ LSNIndexAddEntry(XLogReaderState *state)
 
 		dshash_release_lock(lsn_hash, entry);
 	}
+
+	scan_records_indexed++;
 }
 
 /* ----------------------------------------------------------------
@@ -357,9 +370,9 @@ LSNIndexAddEntry(XLogReaderState *state)
  *
  * A truncation also clears the tail of the last surviving FSM and VM page.
  * To do so it reads that page through the buffer manager, which replays its
- * pending records first, up to the truncation; and from then on the page is
- * in shared buffers, so LSNIndexMustReplayNow() has later records for it
- * applied right away.
+ * pending records first, up to the truncation, and removes its entry.  The
+ * page then sits in shared buffers until a later record for it is indexed;
+ * see LSNIndexPrepareToDefer() for what happens then.
  */
 
 typedef bool (*ForgetMatchFn) (const BufferTag *tag, const void *arg);
@@ -405,12 +418,12 @@ typedef struct ForgetForkArg
 	RelFileLocator rlocator;
 	ForkNumber	forknum;
 	BlockNumber minblkno;
-}			ForgetForkArg;
+} ForgetForkArg;
 
 static bool
 match_fork_from(const BufferTag *tag, const void *arg)
 {
-	const		ForgetForkArg *f = (const ForgetForkArg *) arg;
+	const ForgetForkArg *f = (const ForgetForkArg *) arg;
 	RelFileLocator tag_rlocator = BufTagGetRelFileLocator(tag);
 
 	return RelFileLocatorEquals(tag_rlocator, f->rlocator) &&
@@ -474,24 +487,39 @@ LSNIndexForgetDatabase(Oid dbid)
 }
 
 /*
- * LSNIndexMustReplayNow - should the startup process replay this record now,
- * instead of indexing it?
+ * LSNIndexPrepareToDefer - may the startup process index this record instead
+ * of replaying it?  Makes it so where needed.
  *
- * Yes if it touches a page that's already in shared buffers.  During the
- * scan, a page gets there only when an eagerly replayed record reads it (a
- * truncation reads the last surviving FSM and VM page, say), and reading it
- * replays its indexed records up to the current position.  From then on it
- * has to be kept current, as in normal recovery: an entry indexed for it now
- * would never be replayed, since the page isn't read from disk again while
- * it stays in the buffer pool.  Replaying such a record can read its other
- * pages too, which then stay current the same way.
+ * A record for a page that is in shared buffers cannot just be indexed.  A
+ * page is replayed on demand when it is read from disk, and a resident page
+ * is not read again while it stays in the pool, so the record would never be
+ * applied and the page would be handed out stale.  During the scan a page
+ * gets into the pool only when an eagerly replayed record reads it: a
+ * truncation reads the last surviving FSM and VM page to clear their tails.
+ * That read replayed the page's indexed records up to the truncation and
+ * removed its entry.
  *
- * Also yes for init forks of unlogged relations: at the end of recovery they
- * are copied to the main fork without going through shared buffers, so they
- * must be on disk by then.
+ * So write such a page out, drop it from the pool, and index the record like
+ * any other: the next read of the page is a miss and replays it on demand.
+ * The write is needed in any case, since the tail clear has no record of its
+ * own.  An earlier version kept the page current instead, by replaying every
+ * later record for it at once.  But replaying a record reads its other pages
+ * into the pool, which then had to be kept current the same way, and so on:
+ * one truncation of a table that fits in one VM page (about 255 MB of heap)
+ * made the rest of that table's records eager.
+ *
+ * EvictUnpinnedBuffer() is documented as racy because the buffer may be
+ * reassigned between the lookup and the eviction; that takes a concurrent
+ * allocation, and during the scan no other process allocates buffers.  The
+ * background writer may hold a transient pin while writing the page, in
+ * which case the eviction fails and the record is replayed now, as before.
+ *
+ * Records for the init fork of an unlogged relation are always replayed now:
+ * at the end of recovery the init fork is copied to the main fork without
+ * going through shared buffers, so it must be on disk by then.
  */
 bool
-LSNIndexMustReplayNow(XLogReaderState *record)
+LSNIndexPrepareToDefer(XLogReaderState *record)
 {
 	for (int block_id = 0; block_id <= record->record->max_block_id; block_id++)
 	{
@@ -502,13 +530,17 @@ LSNIndexMustReplayNow(XLogReaderState *record)
 		uint32		hash;
 		LWLock	   *partitionLock;
 		int			buf_id;
+		bool		flushed;
 
 		if (!XLogRecHasBlockRef(record, block_id))
 			continue;
 
 		XLogRecGetBlockTag(record, block_id, &rlocator, &forknum, &blkno);
 		if (forknum == INIT_FORKNUM)
-			return true;
+		{
+			scan_records_replayed++;
+			return false;
+		}
 
 		InitBufferTag(&tag, &rlocator, forknum, blkno);
 		hash = BufTableHashCode(&tag);
@@ -517,11 +549,41 @@ LSNIndexMustReplayNow(XLogReaderState *record)
 		buf_id = BufTableLookup(&tag, hash);
 		LWLockRelease(partitionLock);
 
-		if (buf_id >= 0)
-			return true;
+		if (buf_id < 0)
+			continue;
+
+		if (!EvictUnpinnedBuffer(BufferDescriptorGetBuffer(GetBufferDescriptor(buf_id)),
+								 &flushed))
+		{
+			scan_records_replayed++;
+			return false;
+		}
+
+		scan_pages_evicted++;
+		elog(DEBUG1, "fast recovery: evicted block %u of relation %u/%u/%u fork %d to index its records",
+			 blkno, rlocator.spcOid, rlocator.dbOid, rlocator.relNumber, forknum);
 	}
 
-	return false;
+	return true;
+}
+
+/*
+ * LSNIndexLogScanSummary - report what the scan did, once it is over.
+ */
+void
+LSNIndexLogScanSummary(void)
+{
+	if (lsn_dsa == NULL)
+		return;
+
+	ereport(LOG,
+			errmsg("fast crash recovery: deferred %lld records for %lld pages (%zu MB of index), extended files by %lld blocks; replayed %lld records with block references immediately, evicting %lld pages",
+				   (long long) scan_records_indexed,
+				   (long long) scan_pages_indexed,
+				   dsa_get_total_size(lsn_dsa) / (1024 * 1024),
+				   (long long) scan_blocks_extended,
+				   (long long) scan_records_replayed,
+				   (long long) scan_pages_evicted));
 }
 
 /* ----------------------------------------------------------------
