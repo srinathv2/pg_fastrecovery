@@ -387,7 +387,11 @@ XLogReadBufferForRedoExtended(XLogReaderState *record,
 	/*
 	 * During on-demand replay of one page, skip the record's other pages:
 	 * their own replay applies the record to them.  Callers that initialize a
-	 * page use the buffer whatever we return, so they get a scratch one.
+	 * page use the buffer whatever we return, so they get a scratch one.  A
+	 * block with an image to apply is always BLK_RESTORED in normal recovery,
+	 * and some redo routines rely on that (the FPI loop in xlog_redo(), hash
+	 * and gin page initialization), so restore the image into a scratch
+	 * buffer for them; the page's own replay restores it for real.
 	 */
 	if (inReplayPageWals)
 	{
@@ -397,6 +401,19 @@ XLogReadBufferForRedoExtended(XLogReaderState *record,
 
 		if (!BufferTagsEqual(&targetTag, &recordTag))
 		{
+			if (XLogRecBlockImageApply(record, block_id))
+			{
+				*buf = LSNIndexScratchBuffer(rlocator, forknum, blkno);
+				page = BufferGetPage(*buf);
+				if (!RestoreBlockImage(record, block_id, page))
+					ereport(ERROR,
+							(errcode(ERRCODE_INTERNAL_ERROR),
+							 errmsg_internal("%s", record->errormsg_buf)));
+				if (!PageIsNew(page))
+					PageSetLSN(page, lsn);
+				MarkBufferDirty(*buf);
+				return BLK_RESTORED;
+			}
 			if (mode == RBM_ZERO_AND_LOCK || mode == RBM_ZERO_AND_CLEANUP_LOCK)
 				*buf = LSNIndexScratchBuffer(rlocator, forknum, blkno);
 			else

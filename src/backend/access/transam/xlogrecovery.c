@@ -1929,6 +1929,7 @@ ApplyWalRecord(XLogReaderState *xlogreader, XLogRecord *record, TimeLineID *repl
 {
 	ErrorContextCallback errcallback;
 	bool		switchedTLI = false;
+	bool		deferred = false;
 
 	/* Setup error traceback support for ereport() */
 	errcallback.callback = rm_redo_error_callback;
@@ -2011,7 +2012,10 @@ ApplyWalRecord(XLogReaderState *xlogreader, XLogRecord *record, TimeLineID *repl
 	 */
 	if (LSNIndexIsActive() && XLogRecHasAnyBlockRefs(xlogreader) &&
 		!LSNIndexMustReplayNow(xlogreader))
+	{
 		LSNIndexAddEntry(xlogreader);
+		deferred = true;
+	}
 	else
 	{
 		/*
@@ -2028,9 +2032,11 @@ ApplyWalRecord(XLogReaderState *xlogreader, XLogRecord *record, TimeLineID *repl
 	/*
 	 * After redo, check whether the backup pages associated with the WAL
 	 * record are consistent with the existing pages. This check is done only
-	 * if consistency check is enabled for this record.
+	 * if consistency check is enabled for this record, and only for records
+	 * applied here: a deferred record's pages are replayed later, by whoever
+	 * reads them, and reading them now would replay them past this record.
 	 */
-	if ((record->xl_info & XLR_CHECK_CONSISTENCY) != 0)
+	if (!deferred && (record->xl_info & XLR_CHECK_CONSISTENCY) != 0)
 		verifyBackupPageConsistency(xlogreader);
 
 	/* Pop the error context stack */

@@ -261,6 +261,8 @@ LSNIndexAddEntry(XLogReaderState *state)
 	RelFileLocator rlocator;
 	ForkNumber	forknum;
 	BlockNumber blkno;
+	BlockNumber nblocks;
+	SMgrRelation smgr;
 	BufferTag	tag;
 	PageLSNEntry *entry;
 	bool		found;
@@ -277,6 +279,24 @@ LSNIndexAddEntry(XLogReaderState *state)
 
 		XLogRecGetBlockTag(state, blk_id, &rlocator, &forknum, &blkno);
 		InitBufferTag(&tag, &rlocator, forknum, blkno);
+
+		/*
+		 * Make sure the page exists on disk before anyone can ask for it.  A
+		 * record can be for a block past the end of its file: the page was
+		 * created in shared buffers and never written before the crash, or
+		 * the file was truncated earlier in this WAL and the block recreated
+		 * after.  Stock recovery extends the file when it replays such a
+		 * record (see XLogReadBufferExtended()); do the same now, while no
+		 * other process can be extending the relation.  Otherwise a backend
+		 * would later be handed this block as a brand new page, and its
+		 * pending records would be lost with it.  The fork may not exist yet
+		 * at all, like a visibility map before its first page.
+		 */
+		smgr = smgropen(rlocator, INVALID_PROC_NUMBER);
+		smgrcreate(smgr, forknum, true);
+		nblocks = smgrnblocks(smgr, forknum);
+		if (blkno >= nblocks)
+			smgrzeroextend(smgr, forknum, nblocks, blkno - nblocks + 1, false);
 
 		entry = (PageLSNEntry *) dshash_find_or_insert(lsn_hash, &tag, &found);
 
