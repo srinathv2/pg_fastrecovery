@@ -27,6 +27,7 @@
 #include <ctype.h>
 #include <time.h>
 #include <sys/stat.h>
+#include <fcntl.h>
 #include <sys/time.h>
 #include <unistd.h>
 
@@ -4321,6 +4322,18 @@ XLogFileRead(XLogSegNo segno, TimeLineID tli,
 	{
 		/* Success! */
 		curFileTLI = tli;
+
+#if defined(USE_POSIX_FADVISE) && defined(POSIX_FADV_WILLNEED)
+
+		/*
+		 * Fast crash recovery decodes WAL faster than the kernel grows its
+		 * readahead window for 8 kB reads, and then waits at nearly every
+		 * window.  Ask for the whole segment at once; the kernel reads it in
+		 * the background while we decode what has already arrived.
+		 */
+		if (LSNIndexIsActive())
+			(void) posix_fadvise(fd, 0, 0, POSIX_FADV_WILLNEED);
+#endif
 
 		/* Report recovery progress in PS display */
 		snprintf(activitymsg, sizeof(activitymsg), "recovering %s",
