@@ -72,7 +72,7 @@ $node->stop('immediate');
 my $log_offset = -s $node->logfile;
 $node->start;
 
-ok( $node->log_contains('Fast recovery worker started', $log_offset),
+ok( $node->log_contains('fast recovery worker started', $log_offset),
 	'crash recovery used on-demand WAL replay');
 ok( $node->log_contains(
 		qr/fast recovery: evicted block \d+ of relation \S+ fork \d+ to index its records/,
@@ -90,7 +90,7 @@ is($node->safe_psql('postgres', $shrunkscan),
 	'truncated-and-regrown table correct right after the server opened');
 
 # 2. After the worker has recovered every remaining page.
-$node->wait_for_log(qr/Fast recovery complete/, $log_offset);
+$node->wait_for_log(qr/fast crash recovery complete/, $log_offset);
 is($node->safe_psql('postgres', $seqscan),
 	$expected_seq, 'data correct after the worker drained the index');
 is($node->safe_psql('postgres', $shrunkscan),

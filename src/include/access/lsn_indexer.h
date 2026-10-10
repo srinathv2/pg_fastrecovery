@@ -1,14 +1,15 @@
 /*-------------------------------------------------------------------------
  *
  * lsn_indexer.h
- *    Header for LSN-based WAL indexing for fast recovery.
+ *	  Index of pending WAL records by page, for on-demand replay after a crash
  *
- * This module builds a mapping of BufferTag to a list of WAL LSNs
- * during crash recovery and supports later use for on-demand WAL replay.
+ * The index maps a BufferTag to the list of LSNs of the WAL records that
+ * touch that page and have not been replayed yet.  It lives in a dshash
+ * table in a DSA area, so it needs no size estimate up front.
  *
- * Uses dshash (dynamic shared hash table) backed by dsa (dynamic shared
- * area) so the hash table grows dynamically — no upfront size estimate
- * needed.
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
+ *
+ * src/include/access/lsn_indexer.h
  *
  *-------------------------------------------------------------------------
  */
@@ -17,14 +18,14 @@
 #define LSN_INDEXER_H
 
 #include "access/xlogreader.h"
+#include "lib/dshash.h"
 #include "port/atomics.h"
 #include "storage/block.h"
 #include "storage/buf_internals.h"
-#include "lib/dshash.h"
 #include "utils/dsa.h"
 
 /*
- * LSNNode — one WAL record LSN for a page, stored in DSA memory.
+ * LSNNode - one WAL record LSN for a page, stored in DSA memory.
  * Linked via dsa_pointer instead of raw pointers.
  */
 typedef struct LSNNode
@@ -35,7 +36,7 @@ typedef struct LSNNode
 } LSNNode;
 
 /*
- * PageLSNEntry — dshash entry: BufferTag -> list of LSNs.
+ * PageLSNEntry - dshash entry: BufferTag -> list of LSNs.
  * The key (BufferTag) must be at the start for dshash.
  */
 typedef struct PageLSNEntry
@@ -47,7 +48,7 @@ typedef struct PageLSNEntry
 } PageLSNEntry;
 
 /*
- * LSNIndexControl — small fixed-size struct in traditional shared memory.
+ * LSNIndexControl - small fixed-size struct in traditional shared memory.
  * Holds handles so any process can attach to the DSA and dshash.
  *
  * is_active is set when the startup process creates the index and cleared
@@ -82,17 +83,17 @@ extern bool inReplayPageWals;
 extern BufferTag targetTag;
 extern Buffer targetBuffer;
 
-/* Phase 1: postmaster-safe — allocates control struct in main shmem */
+/* Phase 1: postmaster-safe - allocates control struct in main shmem */
 extern Size LSNIndexShmemSize(void);
 extern void LSNIndexShmemInit(void *arg);
 
 /*
- * Phase 2: backend-context — creates the DSA+dshash on first call,
+ * Phase 2: backend-context - creates the DSA+dshash on first call,
  * attaches on subsequent calls.  Called by the startup process.
  */
 extern void LSNIndexInit(void);
 
-/* Attach to an existing index — used by backends and the worker */
+/* Attach to an existing index - used by backends and the worker */
 extern void LSNIndexAttach(void);
 extern void LSNIndexDetach(void);
 
@@ -123,6 +124,7 @@ extern void LSNIndexForgetDatabase(Oid dbid);
 extern bool LSNIndexBeginPageReplay(const BufferTag *tag);
 extern void LSNIndexReplayIntoBuffer(Buffer buffer);
 extern void LSNIndexEndPageReplay(void);
+extern void LSNIndexErrorCleanup(void);
 
 /* Drop a page's pending records: replayed, or about to be zeroed */
 extern void LSNIndexForgetPage(const BufferTag *tag);
@@ -132,7 +134,7 @@ extern Buffer LSNIndexScratchBuffer(RelFileLocator rlocator, ForkNumber forknum,
 									BlockNumber blkno);
 
 /* Get the dshash table pointer (for sequential scans by the worker) */
-extern dshash_table *lsn_hash_for_worker(void);
+extern dshash_table *LSNIndexGetHash(void);
 
 /* End fast recovery once every page has been replayed (worker only) */
 extern void LSNIndexFinish(void);

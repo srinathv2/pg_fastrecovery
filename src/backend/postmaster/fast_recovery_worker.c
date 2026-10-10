@@ -1,44 +1,42 @@
 /*-------------------------------------------------------------------------
  *
  * fast_recovery_worker.c
- *    Background worker that proactively replays WAL for all pages in
- *    the LSN index, so that on-demand replay overhead is eliminated
- *    over time.
+ *	  Auxiliary process that recovers the pages left pending by fast crash
+ *	  recovery, so that none is left for a backend to replay on first use
+ *
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
+ *
+ * IDENTIFICATION
+ *	  src/backend/postmaster/fast_recovery_worker.c
  *
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
 
+#include "access/lsn_indexer.h"
+#include "access/rmgr.h"
 #include "access/xlog.h"
+#include "access/xlog_internal.h"
 #include "access/xlogreader.h"
 #include "access/xlogutils.h"
-#include "access/xlog_internal.h"
-#include "access/rmgr.h"
 #include "lib/dshash.h"
 #include "libpq/pqsignal.h"
-#include "storage/bufmgr.h"
-#include "access/lsn_indexer.h"
 #include "miscadmin.h"
 #include "postmaster/auxprocess.h"
 #include "postmaster/bgwriter.h"
+#include "postmaster/fast_recovery_worker.h"
 #include "postmaster/interrupt.h"
+#include "storage/bufmgr.h"
 #include "storage/ipc.h"
 #include "storage/procsignal.h"
-#include "postmaster/fast_recovery_worker.h"
 
 /*
- * FastRecoveryMain — iterate every page in the LSN index and read it,
- * which triggers on-demand WAL replay via ReadBuffer_common.
+ * FastRecoveryMain - read every page in the LSN index, which replays it.
  *
- * IMPORTANT: dshash_seq_next holds the partition LWLock until the next
- * call, term, or partition crossing.  ReadBufferWithoutRelcache below
- * triggers on-demand replay, which calls dshash_find() — that would
- * try to re-acquire the SAME partition lock and self-deadlock (LWLocks
- * are not reentrant).
- *
- * To break that, collect all tags into a local list under the seq
- * iteration, terminate the iteration to release partition locks, and
- * THEN read each buffer.
+ * dshash_seq_next() holds a partition lock until the next call, and reading
+ * a page runs on-demand replay, which looks the page up in the same table;
+ * LWLocks are not reentrant.  So collect the tags first, end the scan, and
+ * only then read the pages.
  */
 static void
 FastRecoveryMain(void)
@@ -49,32 +47,32 @@ FastRecoveryMain(void)
 	int			ntags = 0;
 	int			ncap = 0;
 
-	elog(LOG, "Fast recovery worker started");
+	ereport(LOG,
+			errmsg("fast recovery worker started"));
 
 	LSNIndexAttach();
 
-	/*
-	 * Phase 1: snapshot all tags.  dshash_seq_next holds the partition lock
-	 * and asserts it on the next call, so we MUST NOT call
-	 * dshash_release_lock between iterations — let seq_next/term manage the
-	 * partition lock lifecycle.  We just copy the tag value out.
-	 */
-	dshash_seq_init(&seq, lsn_hash_for_worker(), false);
+	dshash_seq_init(&seq, LSNIndexGetHash(), false);
 	while ((entry = (PageLSNEntry *) dshash_seq_next(&seq)) != NULL)
 	{
 		if (ntags == ncap)
 		{
 			ncap = ncap ? ncap * 2 : 1024;
-			tags = (BufferTag *) repalloc(tags ? tags : palloc(0),
-										  sizeof(BufferTag) * ncap);
+			if (tags == NULL)
+				tags = (BufferTag *) palloc(sizeof(BufferTag) * ncap);
+			else
+				tags = (BufferTag *) repalloc(tags, sizeof(BufferTag) * ncap);
 		}
 		tags[ntags++] = entry->tag;
 	}
 	dshash_seq_term(&seq);
 
-	elog(LOG, "Fast recovery worker: replaying %d pages", ntags);
+	ereport(LOG,
+			errmsg_plural("fast recovery worker replaying %d pending page",
+						  "fast recovery worker replaying %d pending pages",
+						  ntags, ntags));
 
-	/* Phase 2: trigger on-demand replay for each page. */
+	/* Reading a page replays its pending records; see bufmgr.c. */
 	for (int i = 0; i < ntags; i++)
 	{
 		Buffer		buffer;
@@ -107,7 +105,8 @@ FastRecoveryMain(void)
 	 */
 	RequestCheckpoint(CHECKPOINT_FORCE);
 
-	elog(LOG, "Fast recovery complete. Exiting.");
+	ereport(LOG,
+			errmsg("fast crash recovery complete"));
 }
 
 void

@@ -1393,6 +1393,11 @@ ReadBuffer_common(Relation rel, SMgrRelation smgr, char smgr_persistence,
  *
  * Returns false if the block has nothing pending, in which case the caller
  * reads it as usual; true once the buffer is valid.
+ *
+ * If anything in here fails, the error paths (transaction abort, or process
+ * exit) call LSNIndexErrorCleanup(), which cleans the buffer through
+ * AbortPendingBufferReplay() below and resets the replay state; the resource
+ * owner then ends the I/O as for any failed read.
  */
 static bool
 ReadAndReplayPendingBuffer(Buffer buffer, SMgrRelation smgr,
@@ -1404,67 +1409,66 @@ ReadAndReplayPendingBuffer(Buffer buffer, SMgrRelation smgr,
 	if (!LSNIndexBeginPageReplay(&bufHdr->tag))
 		return false;
 
-	PG_TRY();
+	/*
+	 * A read stream may call us in AIO batch mode, with IOs staged but not
+	 * submitted.  We're about to wait for other backends and to read other
+	 * pages, so submit them first; see pgaio_enter_batchmode().
+	 */
+	pgaio_submit_staged();
+
+	if (StartSharedBufferIO(bufHdr, true, true, NULL) == BUFFER_IO_READY_FOR_IO)
 	{
-		/*
-		 * A read stream may call us in AIO batch mode, with IOs staged but
-		 * not submitted.  We're about to wait for other backends and to read
-		 * other pages, so submit them first; see pgaio_enter_batchmode().
-		 */
-		pgaio_submit_staged();
+		Block		bufBlock = BufHdrGetBlock(bufHdr);
+		instr_time	io_start;
 
-		if (StartSharedBufferIO(bufHdr, true, true, NULL) == BUFFER_IO_READY_FOR_IO)
-		{
-			Block		bufBlock = BufHdrGetBlock(bufHdr);
+		io_start = pgstat_prepare_io_time(track_io_timing);
+		smgrread(smgr, forknum, blocknum, bufBlock);
+		pgstat_count_io_op_time(io_object, io_context, IOOP_READ,
+								io_start, 1, BLCKSZ);
+		pgBufferUsage.shared_blks_read++;
 
-			PG_TRY(2);
-			{
-				instr_time	io_start;
+		if (!PageIsVerified((Page) bufBlock, blocknum, PIV_LOG_WARNING, NULL))
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("invalid page in block %u of relation \"%s\"",
+							blocknum,
+							relpathperm(smgr->smgr_rlocator.locator,
+										forknum).str)));
 
-				io_start = pgstat_prepare_io_time(track_io_timing);
-				smgrread(smgr, forknum, blocknum, bufBlock);
-				pgstat_count_io_op_time(io_object, io_context, IOOP_READ,
-										io_start, 1, BLCKSZ);
-				pgBufferUsage.shared_blks_read++;
+		LSNIndexReplayIntoBuffer(buffer);
 
-				if (!PageIsVerified((Page) bufBlock, blocknum, PIV_LOG_WARNING,
-									NULL))
-					ereport(ERROR,
-							(errcode(ERRCODE_DATA_CORRUPTED),
-							 errmsg("invalid page in block %u of relation \"%s\"",
-									blocknum,
-									relpathperm(smgr->smgr_rlocator.locator,
-												forknum).str)));
+		TerminateBufferIO(bufHdr, false, BM_VALID, true, false);
 
-				LSNIndexReplayIntoBuffer(buffer);
-			}
-			PG_CATCH(2);
-			{
-				/*
-				 * The page isn't valid, and whatever redo did to it goes.
-				 * Clear BM_DIRTY ourselves, since AbortBufferIO() insists
-				 * that a buffer that isn't valid isn't dirty either.  Waiters
-				 * wake up, find no valid page, and try again.
-				 */
-				TerminateBufferIO(bufHdr, true, BM_IO_ERROR, true, false);
-				PG_RE_THROW();
-			}
-			PG_END_TRY(2);
-
-			TerminateBufferIO(bufHdr, false, BM_VALID, true, false);
-
-			/* Valid means current: never replay it again. */
-			LSNIndexForgetPage(&bufHdr->tag);
-		}
-		/* else someone else replayed it while we waited */
+		/* Valid means current: never replay it again. */
+		LSNIndexForgetPage(&bufHdr->tag);
 	}
-	PG_FINALLY();
-	{
-		LSNIndexEndPageReplay();
-	}
-	PG_END_TRY();
+	/* else someone else replayed it while we waited */
+
+	LSNIndexEndPageReplay();
 
 	return true;
+}
+
+/*
+ * Fast crash recovery: the on-demand replay into 'buffer' failed.
+ *
+ * Called by LSNIndexErrorCleanup() before the resource owner that started
+ * the I/O gets to AbortBufferIO(), which ends it as for any failed read.
+ * Redo dirtied the buffer before it was valid, which nothing else ever does,
+ * and AbortBufferIO() rightly insists that an invalid buffer is clean; so
+ * clean it, and leave the rest to the usual path.  The page was never valid
+ * and its entry is still in the index: the next reader starts over.
+ */
+void
+AbortPendingBufferReplay(Buffer buffer)
+{
+	BufferDesc *bufHdr = GetBufferDescriptor(buffer - 1);
+	uint64		buf_state;
+
+	buf_state = LockBufHdr(bufHdr);
+	Assert(buf_state & BM_IO_IN_PROGRESS);
+	Assert(!(buf_state & BM_VALID));
+	UnlockBufHdrExt(bufHdr, buf_state, 0, BM_DIRTY | BM_CHECKPOINT_NEEDED, 0);
 }
 
 static pg_always_inline bool

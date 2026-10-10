@@ -1,30 +1,38 @@
 /*-------------------------------------------------------------------------
  *
  * lsn_indexer.c
- *    LSN-based WAL indexing for fast crash recovery.
+ *	  Index of pending WAL records by page, for on-demand replay after a crash
  *
- * During crash recovery the startup process scans WAL records and,
- * instead of replaying them, records each (BufferTag -> LSN) mapping
- * in a dshash table backed by a DSA area.  Later, when a backend or
- * the fast-recovery worker reads a page from disk, the pending WAL
- * records for that page are replayed on demand.
+ * During crash recovery the startup process scans the WAL and, instead of
+ * replaying the records that modify relation pages, files the LSN of each
+ * one under the page it touches, in a dshash table in dynamic shared memory.
+ * The server then opens.  A page's pending records are replayed when the
+ * page is first read from disk, by whichever process reads it, and the fast
+ * recovery worker reads the rest in the background.
+ *
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
+ *
+ * IDENTIFICATION
+ *	  src/backend/access/transam/lsn_indexer.c
  *
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
 
+#include "access/lsn_indexer.h"
 #include "access/xlog.h"
+#include "access/xlog_internal.h"
 #include "access/xlogreader.h"
 #include "access/xlogrecovery.h"
-#include "access/xlog_internal.h"
 #include "access/xlogutils.h"
-#include "access/lsn_indexer.h"
+#include "common/hashfn.h"
 #include "common/relpath.h"
 #include "lib/dshash.h"
 #include "lib/stringinfo.h"
 #include "miscadmin.h"
 #include "storage/buf_internals.h"
 #include "storage/bufmgr.h"
+#include "storage/ipc.h"
 #include "storage/latch.h"
 #include "storage/lwlock.h"
 #include "storage/shmem.h"
@@ -33,7 +41,6 @@
 #include "utils/hsearch.h"
 #include "utils/memutils.h"
 #include "utils/wait_event.h"
-#include "common/hashfn.h"
 
 /* GUC variable */
 bool		fast_crash_recovery = false;
@@ -58,6 +65,12 @@ Buffer		targetBuffer = InvalidBuffer;
  */
 static bool replay_begun = false;
 static BufferTag replaying_tag;
+
+/* InRecovery before on-demand redo set it; see LSNIndexReplayIntoBuffer() */
+static bool saved_in_recovery = false;
+
+/* Is lsn_index_exit_callback() registered in this process? */
+static bool exit_callback_registered = false;
 
 /* Have we run RmgrStartup() for on-demand replay in this process? */
 static bool rmgrs_started = false;
@@ -124,7 +137,7 @@ LSNIndexShmemRequest(void *arg)
  *
  * Allocates the small control struct in main shmem and initializes the
  * DSA/dshash handles to "invalid".  This must be safe to run in the
- * postmaster, so we deliberately do NOT call dsa_create here — dsm.c
+ * postmaster, so we deliberately do NOT call dsa_create here - dsm.c
  * forbids that with an assertion (no PROC entry, no error path, etc.).
  *
  * Children inherit the LSNIndexCtl pointer through fork.  Whichever
@@ -149,6 +162,29 @@ LSNIndexShmemInit(void *arg)
  *  Lazy create + attach
  * ----------------------------------------------------------------
  */
+
+/*
+ * Run LSNIndexErrorCleanup() if this process exits with a replay in
+ * progress.  An ERROR in an auxiliary process is a FATAL, and a FATAL never
+ * reaches the transaction abort path, where the cleanup normally runs.
+ * before_shmem_exit() callbacks run last-registered first, and we register
+ * after ShutdownPostgres() and ReleaseAuxProcessResources(), the two that
+ * would otherwise reach AbortBufferIO() with the buffer still dirty.
+ */
+static void
+lsn_index_exit_callback(int code, Datum arg)
+{
+	LSNIndexErrorCleanup();
+}
+
+static void
+register_exit_callback(void)
+{
+	if (exit_callback_registered)
+		return;
+	before_shmem_exit(lsn_index_exit_callback, 0);
+	exit_callback_registered = true;
+}
 
 /*
  * LSNIndexInit - phase 2: create the DSA+dshash if not yet done, else attach.
@@ -177,7 +213,7 @@ LSNIndexInit(void)
 
 	if (LSNIndexCtl->dsa_handle == DSA_HANDLE_INVALID)
 	{
-		/* First in — create the DSA + dshash and publish handles. */
+		/* First in - create the DSA + dshash and publish handles. */
 		lsn_dsa = dsa_create(LWTRANCHE_LSN_INDEX_DSA);
 		dsa_pin(lsn_dsa);
 		dsa_pin_mapping(lsn_dsa);
@@ -190,7 +226,7 @@ LSNIndexInit(void)
 	}
 	else
 	{
-		/* Already created — just attach. */
+		/* Already created - just attach. */
 		lsn_dsa = dsa_attach(LSNIndexCtl->dsa_handle);
 		dsa_pin_mapping(lsn_dsa);
 		lsn_hash = dshash_attach(lsn_dsa, &lsn_dsh_params,
@@ -199,12 +235,14 @@ LSNIndexInit(void)
 
 	LWLockRelease(LSNIndexLock);
 	MemoryContextSwitchTo(oldcxt);
+
+	register_exit_callback();
 }
 
 /*
  * LSNIndexAttach - attach to an already-created index.
  *
- * Used by backends and the fast-recovery worker.  Returns silently if the
+ * Used by backends and the fast recovery worker.  Returns silently if the
  * index doesn't exist or has already been destroyed by the worker.
  */
 void
@@ -222,7 +260,7 @@ LSNIndexAttach(void)
 	oldcxt = MemoryContextSwitchTo(TopMemoryContext);
 	LWLockAcquire(LSNIndexLock, LW_SHARED);
 
-	/* Re-check under the lock — the worker may have torn it down. */
+	/* Re-check under the lock - the worker may have torn it down. */
 	if (LSNIndexCtl->is_active &&
 		LSNIndexCtl->dsa_handle != DSA_HANDLE_INVALID)
 	{
@@ -234,6 +272,9 @@ LSNIndexAttach(void)
 
 	LWLockRelease(LSNIndexLock);
 	MemoryContextSwitchTo(oldcxt);
+
+	if (lsn_hash != NULL)
+		register_exit_callback();
 }
 
 void
@@ -745,9 +786,10 @@ StartRmgrsForOnDemandReplay(void)
  *
  * Called by the buffer manager for a page it's about to read from disk.  On
  * false, there's nothing to replay: read the page as usual.  On true, the
- * caller must read the page, replay it, mark it valid, and in any case call
- * LSNIndexEndPageReplay().  Until then FastRecoveryInProgress() counts us,
- * so no checkpoint can start before the page is valid and dirty.
+ * caller must read the page, replay it, mark it valid, and call
+ * LSNIndexEndPageReplay(); if any of that fails, LSNIndexErrorCleanup()
+ * undoes it instead.  Until then FastRecoveryInProgress() counts us, so no
+ * checkpoint can start before the page is valid and dirty.
  *
  * is_active is checked and the counter bumped under LSNIndexLock, so
  * LSNIndexFinish(), which clears is_active under the same lock in exclusive
@@ -821,6 +863,39 @@ LSNIndexEndPageReplay(void)
 }
 
 /*
+ * LSNIndexErrorCleanup - undo an on-demand replay that an error cut short.
+ *
+ * Called from AbortTransaction() and AbortSubTransaction(), next to
+ * pgaio_error_cleanup() and before the resource owner that started the
+ * buffer's I/O ends it, and at process exit.  Redo dirties the buffer before
+ * it is valid, which nothing else ever does, and AbortBufferIO() rightly
+ * insists that an invalid buffer is clean; so clean it here, and let the
+ * resource owner end the I/O as for any failed read.  The page was never
+ * valid and its entry is still in the index, so the next reader starts over.
+ * Then forget the replay, so that this process can read pages again and
+ * stops holding checkpoints off.
+ *
+ * Scratch buffers handed to redo may still be pinned at this point; the next
+ * replay drops them, once the pins are gone.
+ */
+void
+LSNIndexErrorCleanup(void)
+{
+	if (!replay_begun)
+		return;
+
+	if (inReplayPageWals)
+	{
+		AbortPendingBufferReplay(targetBuffer);
+		inReplayPageWals = false;
+		targetBuffer = InvalidBuffer;
+		InRecovery = saved_in_recovery;
+	}
+
+	LSNIndexEndPageReplay();
+}
+
+/*
  * LSNIndexReplayIntoBuffer - apply a page's pending records to its buffer.
  *
  * The caller holds 'buffer' pinned and its I/O-in-progress flag, and has
@@ -837,7 +912,6 @@ LSNIndexReplayIntoBuffer(Buffer buffer)
 	BufferTag	tag = GetBufferDescriptor(buffer - 1)->tag;
 	PageLSNEntry *entry;
 	dsa_pointer head_dp;
-	bool		save_in_recovery;
 
 	Assert(replay_begun && BufferTagsEqual(&replaying_tag, &tag));
 	Assert(!inReplayPageWals);
@@ -871,23 +945,20 @@ LSNIndexReplayIntoBuffer(Buffer buffer)
 	 * another process, so say so for the duration of the redo calls.  Nothing
 	 * redo does under closure consults the flag for its other meaning, "I am
 	 * the startup process": it reads no page but the one it's handed.
+	 *
+	 * Should redo fail, LSNIndexErrorCleanup() puts all of this back.
 	 */
-	save_in_recovery = InRecovery;
+	saved_in_recovery = InRecovery;
 	InRecovery = true;
 	inReplayPageWals = true;
 	targetTag = tag;
 	targetBuffer = buffer;
-	PG_TRY();
-	{
-		ReplayPageRecords(&tag, head_dp);
-	}
-	PG_FINALLY();
-	{
-		inReplayPageWals = false;
-		targetBuffer = InvalidBuffer;
-		InRecovery = save_in_recovery;
-	}
-	PG_END_TRY();
+
+	ReplayPageRecords(&tag, head_dp);
+
+	inReplayPageWals = false;
+	targetBuffer = InvalidBuffer;
+	InRecovery = saved_in_recovery;
 }
 
 /*
@@ -926,12 +997,12 @@ LSNIndexForgetPage(const BufferTag *tag)
 }
 
 /* ----------------------------------------------------------------
- *  Accessor for the dshash table (used by fast-recovery worker)
+ *  Accessor for the dshash table (used by fast recovery worker)
  * ----------------------------------------------------------------
  */
 
 dshash_table *
-lsn_hash_for_worker(void)
+LSNIndexGetHash(void)
 {
 	Assert(lsn_hash != NULL);
 	return lsn_hash;
